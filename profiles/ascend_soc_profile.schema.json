@@ -1,0 +1,234 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://projects.local/ascend/ascend_soc_profile.schema.json",
+  "title": "Ascend SoC Profile",
+  "description": "Unified declarative hardware manifest for Ascend NPU tooling. One file per SoC in a shared profiles/ directory describes everything ascend-pipesim (analytical simulation) and ascend_analyzer (static AST auditing) need, so new chips or commercial binnings are added as data, never as source-code changes. Tool-neutral by design: each consumer validates and reads the subset it needs; unknown sections must be ignored, not rejected.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "soc_name", "isa_generation"],
+  "allOf": [
+    {
+      "if": {"required": ["base_profile"]},
+      "then": {},
+      "else": {
+        "comment": "Standalone profile: the core sections must be present in full.",
+        "required": ["memory_domains", "transfer_channels", "compute_engines"]
+      }
+    },
+    {
+      "if": {"properties": {"commercial_label": {"const": true}}, "required": ["commercial_label"]},
+      "then": {
+        "comment": "A commercial/tender label derives from real silicon: it must name a base and may not redefine microarchitecture. Identity, aliases, notes and system binning metadata are the only legal overrides.",
+        "required": ["base_profile"],
+        "properties": {
+          "memory_domains": false,
+          "transfer_channels": false,
+          "compute_engines": false,
+          "synchronization": false,
+          "ub_partitioning": false,
+          "features": false,
+          "access_block_bytes": false
+        }
+      }
+    }
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "const": 1,
+      "description": "Manifest format revision. Loaders reject unknown major revisions."
+    },
+    "soc_name": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_]*$",
+      "description": "Canonical target name, matching the file name stem and the value passed to --arch / --chip."
+    },
+    "display_name": {
+      "type": "string",
+      "description": "Human-readable marketing/series name shown in reports."
+    },
+    "isa_generation": {
+      "type": "string",
+      "enum": ["davinci_v1", "davinci_v15", "davinci_v2", "davinci_v2p", "davinci_v3"],
+      "description": "Microarchitecture generation. Gates instruction-set features and structural invariants."
+    },
+    "base_profile": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_]*$",
+      "description": "Optional parent profile this one derives from. Every absent field is inherited (deep merge: objects merge per-key, arrays and scalars replace). A profile that sets base_profile and only system/commercial metadata is a commercial binning, not a new architecture."
+    },
+    "aliases": {
+      "type": "array",
+      "items": {"type": "string", "pattern": "^[a-z0-9_-]+$"},
+      "description": "Alternate names accepted by --arch / --chip lookups (normalized: lower-case, '-' and '_' stripped)."
+    },
+    "commercial_label": {
+      "type": "boolean",
+      "default": false,
+      "description": "True when this name is a commercial/tender designation layered over base_profile silicon rather than an independent die. Such profiles MUST NOT introduce microarchitectural facts (pools, channels, dtype throughputs) that differ from their base."
+    },
+    "provisional": {
+      "type": "boolean",
+      "default": false,
+      "description": "Capacities inferred rather than datasheet-confirmed; consumers surface this in reports."
+    },
+    "notes": {"type": "string"},
+    "system": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Chip- and package-level facts outside the single-AI-Core microarchitecture.",
+      "properties": {
+        "ai_cores": {"type": "integer", "minimum": 1, "description": "AI Cores enabled in this binning (all engines)."},
+        "cube_cores": {"type": "integer", "minimum": 1, "description": "Cube-capable AI Cores."},
+        "vector_cores": {"type": "integer", "minimum": 1, "description": "Vector/SIMD cores (may exceed cube_cores)."},
+        "core_freq_mhz": {"type": "number", "exclusiveMinimum": 0},
+        "l2_cache_bytes": {"type": "integer", "minimum": 0},
+        "hbm_bandwidth_gbps": {"type": "number", "minimum": 0, "description": "Aggregate off-chip bandwidth. No independent calibration is implied for commercial_label profiles."},
+        "decoupled_vector_core": {"type": "boolean", "description": "False on fused Cube+Vector parts, where a Vector epilogue blocks Cube issue."}
+      }
+    },
+    "access_block_bytes": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Natural SRAM access granule (the 32 B quantization block shared by bank interleave, stride checks and gap accounting)."
+    },
+    "memory_domains": {
+      "type": "object",
+      "description": "Physically disjoint storage pools. GM, L1, L0A, L0B, L0C, UB are the DaVinci core set; BT (bias table) and FB (fixpipe parameter buffer) are analyzer-side pools a simulator may ignore.",
+      "patternProperties": {
+        "^(GM|L1|L0A|L0B|L0C|UB|BT|FB)$": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["size_bytes", "alignment_bytes"],
+          "properties": {
+            "size_bytes": {"type": "integer", "minimum": 1},
+            "alignment_bytes": {"type": "integer", "minimum": 1, "description": "Required base-offset alignment of any allocation."},
+            "size_alignment_bytes": {"type": "integer", "minimum": 1, "description": "Required alignment of an allocation's total length; defaults to alignment_bytes."},
+            "stride_alignment_bytes": {"type": "integer", "minimum": 1, "description": "Required alignment of DMA strides expressed in bytes; defaults to alignment_bytes."},
+            "banks": {"type": "integer", "minimum": 1, "description": "Interleaved banks (UB: 8). Drives bank-conflict auditing."},
+            "bank_stride_bytes": {"type": "integer", "minimum": 1, "description": "Interleave period per bank; defaults to access_block_bytes."},
+            "ports": {"type": "integer", "minimum": 1, "description": "Concurrent read/write ports."},
+            "element_bytes": {"type": "integer", "minimum": 1, "description": "Logical element size for typed pools (L0C accumulator: 4 B fp32/int32). Informational: keeps accumulator sizing next to the capacity it derives from."},
+            "description": {"type": "string"}
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": ["L1", "L0A", "L0B", "L0C", "UB"]
+    },
+    "transfer_channels": {
+      "type": "object",
+      "description": "Fixed-function DMA engines between pools.",
+      "patternProperties": {
+        "^(MTE1|MTE2|MTE2_UB|MTE3|FIXPIPE)$": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["src", "dst", "bandwidth_bytes_per_cycle", "base_latency_cycles"],
+          "properties": {
+            "src": {"enum": ["GM", "L1", "L0A", "L0B", "L0C", "UB"]},
+            "dst": {"enum": ["GM", "L1", "L0A", "L0B", "L0C", "UB"]},
+            "bandwidth_bytes_per_cycle": {"type": "number", "exclusiveMinimum": 0},
+            "base_latency_cycles": {"type": "number", "minimum": 0, "description": "Affine latency term charged per transfer (simulator-side; the static auditor ignores it)."},
+            "min_burst_bytes": {"type": "integer", "minimum": 1},
+            "max_outstanding": {"type": "integer", "minimum": 1},
+            "efficiency": {"type": "number", "exclusiveMinimum": 0, "maximum": 1, "description": "Static derate, e.g. for an in-flight ND->NZ reformat."},
+            "description": {"type": "string"}
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": ["MTE1", "MTE2", "FIXPIPE"]
+    },
+    "compute_engines": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["cube", "vector"],
+      "properties": {
+        "cube": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["fractal_shape", "dtype_profiles"],
+          "properties": {
+            "fractal_shape": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["m0", "n0", "k0"],
+              "properties": {
+                "m0": {"type": "integer", "minimum": 1},
+                "n0": {"type": "integer", "minimum": 1},
+                "k0": {"type": "integer", "minimum": 1, "description": "k0 of the FP16/BF16 baseline fractal (16); the per-dtype profile carries the actual widening."}
+              }
+            },
+            "pipeline_latency_cycles": {"type": "number", "minimum": 0},
+            "issue_overhead_cycles": {"type": "number", "minimum": 0},
+            "dtype_profiles": {
+              "type": "object",
+              "description": "Per-element-type Cube behaviour. macs_per_cycle is the sustained MAC rate; k0 widens as the element narrows because the MAC array is byte-oriented.",
+              "patternProperties": {
+                "^(fp32|fp16|bf16|fp8|int8|uint8|int4)$": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["k0", "macs_per_cycle"],
+                  "properties": {
+                    "k0": {"type": "integer", "minimum": 1},
+                    "macs_per_cycle": {"type": "integer", "minimum": 1},
+                    "accumulator": {"enum": ["fp32", "int32"], "default": "fp32"}
+                  }
+                }
+              },
+              "additionalProperties": false,
+              "minProperties": 1
+            },
+            "read_bytes_per_cycle": {"type": "integer", "minimum": 1, "description": "Operand-read throughput fallback when a tile shape cannot be recovered statically."}
+          }
+        },
+        "vector": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["bytes_per_cycle", "register_bytes"],
+          "properties": {
+            "bytes_per_cycle": {"type": "number", "exclusiveMinimum": 0, "description": "Sustained element-wise throughput out of the UB."},
+            "register_bytes": {"type": "integer", "minimum": 1, "description": "One full vector instruction's register footprint (the 256 B repeat)."},
+            "pipeline_latency_cycles": {"type": "number", "minimum": 0},
+            "issue_overhead_cycles": {"type": "number", "minimum": 0}
+          }
+        },
+        "scalar": {
+          "type": "object",
+          "additionalProperties": true,
+          "properties": {
+            "pipeline_latency_cycles": {"type": "number", "minimum": 0}
+          }
+        }
+      }
+    },
+    "synchronization": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Cross-pipeline semaphore fabric. HardEvent routes themselves are ISA-level (SRC_DST pipe pairs), not per-chip data.",
+      "properties": {
+        "reserved_event_ids": {"type": "array", "items": {"type": "integer", "minimum": 0}, "description": "EVENT_IDn values owned by the runtime; kernels must not allocate them."},
+        "max_event_id": {"type": "integer", "minimum": 0, "description": "Largest legal EVENT_IDn, inclusive."},
+        "sync_handoff_cycles": {"type": "integer", "minimum": 0, "description": "Analytical SetFlag->WaitFlag hand-off penalty between pipelines."}
+      }
+    },
+    "ub_partitioning": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "SIMD/SIMT parts only: strict UB split between tensors and the SIMT DataCache. Absent on parts where the whole UB serves tensors.",
+      "required": ["total_bytes", "compiler_reserved_bytes", "min_datacache_bytes", "max_usable_bytes"],
+      "properties": {
+        "total_bytes": {"type": "integer", "minimum": 1},
+        "compiler_reserved_bytes": {"type": "integer", "minimum": 0},
+        "min_datacache_bytes": {"type": "integer", "minimum": 1},
+        "max_usable_bytes": {"type": "integer", "minimum": 1},
+        "description": {"type": "string"}
+      }
+    },
+    "features": {
+      "type": "array",
+      "items": {"type": "string"},
+      "description": "Optional instruction-set features (e.g. 'mx_cube'). An intrinsic whose requires_feature is absent here cannot be issued on this part."
+    }
+  }
+}

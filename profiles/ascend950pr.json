@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "soc_name": "ascend950pr",
+  "display_name": "Ascend 950PR (commercial pilot-run binning of Ascend 910B silicon)",
+  "isa_generation": "davinci_v2",
+  "base_profile": "ascend910b",
+  "aliases": ["950pr", "950-pr", "atlas-950-pr", "ascend950prseries"],
+  "commercial_label": true,
+  "provisional": false,
+  "notes": "Ground truth: 'Ascend 950PR' is a commercial/tender designation (Pilot Run / Project Reference), not an independent microarchitecture. The physical die is an Ascend 910B variant (DaVinci v2): every pool capacity, bank rule, alignment, channel bandwidth/latency, dtype throughput and synchronization invariant is inherited verbatim from ascend910b. The only fact this profile adds is system-level binning metadata. No independent HBM calibration is on file: hbm_bandwidth_gbps is inherited from the 910B manifest and must not be quoted as a 950PR-specific measurement. Downstream tools must resolve this profile to silicon-identical behaviour with ascend910b and only report the distinct core count.",
+  "system": {
+    "ai_cores": 20
+  }
+}

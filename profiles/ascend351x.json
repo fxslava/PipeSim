@@ -1,0 +1,161 @@
+{
+  "schema_version": 1,
+  "soc_name": "ascend351x",
+  "display_name": "Ascend 351x (inference series, DaVinci v3 SIMD+SIMT hybrid)",
+  "isa_generation": "davinci_v3",
+  "aliases": ["351x", "ascend3510", "ascend3519", "3510", "3519"],
+  "provisional": true,
+  "notes": "Speculative next-generation manifest for sensitivity studies; treat absolute numbers as unvalidated, use relative trends only. Provenance is deliberately mixed and recorded here (drift D3): transfer-channel widths and per-dtype Cube rates follow ascend-pipesim's v3 model (128 B/cycle engines, 8192 MACs/cycle, FP8 path), while domain capacities and the UB partitioning quadruple follow the static analyzer's enforcement model (512 KiB L1; UB strictly split between tensors and the SIMT DataCache). ascend-pipesim additionally models a 1 MiB L1 for this part - 2x the enforcement capacity recorded here - so L1-sensitive conclusions differ between tools until the datasheet settles it.",
+  "system": {
+    "ai_cores": 32,
+    "cube_cores": 32,
+    "vector_cores": 64,
+    "core_freq_mhz": 2000,
+    "l2_cache_bytes": 536870912,
+    "hbm_bandwidth_gbps": 4800.0,
+    "decoupled_vector_core": true
+  },
+  "access_block_bytes": 32,
+  "memory_domains": {
+    "GM": {
+      "size_bytes": 68719476736,
+      "alignment_bytes": 512,
+      "ports": 2,
+      "description": "Off-chip HBM; 512 B burst alignment."
+    },
+    "L1": {
+      "size_bytes": 524288,
+      "alignment_bytes": 32,
+      "size_alignment_bytes": 32,
+      "stride_alignment_bytes": 32,
+      "ports": 2,
+      "description": "Cube-local scratchpad. Enforcement capacity (analyzer model); the simulator models 1 MiB - see notes / drift D3."
+    },
+    "L0A": {
+      "size_bytes": 65536,
+      "alignment_bytes": 512,
+      "size_alignment_bytes": 512,
+      "stride_alignment_bytes": 32,
+      "description": "Cube left-matrix operand buffer, Zz fractal layout."
+    },
+    "L0B": {
+      "size_bytes": 65536,
+      "alignment_bytes": 512,
+      "size_alignment_bytes": 512,
+      "stride_alignment_bytes": 32,
+      "description": "Cube right-matrix operand buffer, Nz fractal layout."
+    },
+    "L0C": {
+      "size_bytes": 131072,
+      "alignment_bytes": 1024,
+      "size_alignment_bytes": 1024,
+      "stride_alignment_bytes": 32,
+      "element_bytes": 4,
+      "description": "FP32/INT32 accumulator; 4 B per element."
+    },
+    "UB": {
+      "size_bytes": 262144,
+      "alignment_bytes": 32,
+      "size_alignment_bytes": 32,
+      "stride_alignment_bytes": 32,
+      "banks": 8,
+      "bank_stride_bytes": 32,
+      "ports": 2,
+      "description": "Unified Buffer, 8 banks x 32 B interleave. Strictly partitioned on this part - see ub_partitioning."
+    },
+    "BT": {
+      "size_bytes": 1024,
+      "alignment_bytes": 64,
+      "size_alignment_bytes": 64,
+      "stride_alignment_bytes": 32,
+      "description": "Bias table (fixpipe operand)."
+    },
+    "FB": {
+      "size_bytes": 2048,
+      "alignment_bytes": 128,
+      "size_alignment_bytes": 128,
+      "stride_alignment_bytes": 32,
+      "description": "Fixpipe parameter buffer (quant/dequant scales)."
+    }
+  },
+  "transfer_channels": {
+    "MTE2": {
+      "src": "GM", "dst": "L1",
+      "bandwidth_bytes_per_cycle": 128.0,
+      "base_latency_cycles": 160.0,
+      "min_burst_bytes": 512,
+      "max_outstanding": 8,
+      "description": "GM -> L1 load, optional ND->NZ reformat; v3-wide engine."
+    },
+    "MTE2_UB": {
+      "src": "GM", "dst": "UB",
+      "bandwidth_bytes_per_cycle": 128.0,
+      "base_latency_cycles": 160.0,
+      "min_burst_bytes": 512,
+      "max_outstanding": 8,
+      "description": "GM -> UB load for Vector-side operands."
+    },
+    "MTE1": {
+      "src": "L1", "dst": "L0A",
+      "bandwidth_bytes_per_cycle": 128.0,
+      "base_latency_cycles": 20.0,
+      "min_burst_bytes": 32,
+      "max_outstanding": 4,
+      "description": "L1 -> L0A/L0B fractal load; v3-wide engine."
+    },
+    "FIXPIPE": {
+      "src": "L0C", "dst": "GM",
+      "bandwidth_bytes_per_cycle": 128.0,
+      "base_latency_cycles": 80.0,
+      "min_burst_bytes": 32,
+      "max_outstanding": 4,
+      "description": "L0C -> GM/UB drain; v3-wide engine."
+    },
+    "MTE3": {
+      "src": "UB", "dst": "GM",
+      "bandwidth_bytes_per_cycle": 128.0,
+      "base_latency_cycles": 150.0,
+      "min_burst_bytes": 512,
+      "max_outstanding": 4,
+      "description": "UB -> GM store; v3-wide engine."
+    }
+  },
+  "compute_engines": {
+    "cube": {
+      "fractal_shape": {"m0": 16, "n0": 16, "k0": 16},
+      "pipeline_latency_cycles": 16.0,
+      "issue_overhead_cycles": 1.0,
+      "read_bytes_per_cycle": 1024,
+      "dtype_profiles": {
+        "fp16": {"k0": 16, "macs_per_cycle": 8192, "accumulator": "fp32"},
+        "bf16": {"k0": 16, "macs_per_cycle": 8192, "accumulator": "fp32"},
+        "int8": {"k0": 32, "macs_per_cycle": 16384, "accumulator": "int32"},
+        "uint8": {"k0": 32, "macs_per_cycle": 16384, "accumulator": "int32"},
+        "fp32": {"k0": 8, "macs_per_cycle": 2048, "accumulator": "fp32"},
+        "fp8": {"k0": 32, "macs_per_cycle": 16384, "accumulator": "fp32"}
+      }
+    },
+    "vector": {
+      "bytes_per_cycle": 512.0,
+      "register_bytes": 256,
+      "pipeline_latency_cycles": 8.0,
+      "issue_overhead_cycles": 4.0
+    },
+    "scalar": {
+      "pipeline_latency_cycles": 4.0
+    }
+  },
+  "synchronization": {
+    "reserved_event_ids": [6, 7],
+    "max_event_id": 7,
+    "sync_handoff_cycles": 30
+  },
+  "ub_partitioning": {
+    "total_bytes": 262144,
+    "compiler_reserved_bytes": 8192,
+    "min_datacache_bytes": 32768,
+    "max_usable_bytes": 221184,
+    "description": "Strict SIMD/SIMT split: static+dynamic tensor allocations beyond 216 KiB push the SIMT DataCache below its 32 KiB floor and corrupt memory at runtime (AKA1010)."
+  },
+  "features": ["mx_cube"]
+}

@@ -1,0 +1,152 @@
+{
+  "schema_version": 1,
+  "soc_name": "ascend910b",
+  "display_name": "Ascend 910B (Atlas 800T A2 / Atlas A2 training series)",
+  "isa_generation": "davinci_v2",
+  "aliases": ["910b", "ascend910b2", "ascend910b3", "ascend910b4", "atlas-a2", "a2", "default"],
+  "provisional": false,
+  "notes": "Reference profile for both tools. Decoupled AI Cube / AI Vector cores (2 Vector per Cube), so UB epilogues overlap Cube work. Canonical source for every commercial-label derivative (e.g. ascend950pr).",
+  "system": {
+    "ai_cores": 24,
+    "cube_cores": 24,
+    "vector_cores": 48,
+    "core_freq_mhz": 1800,
+    "l2_cache_bytes": 201326592,
+    "hbm_bandwidth_gbps": 1600.0,
+    "decoupled_vector_core": true
+  },
+  "access_block_bytes": 32,
+  "memory_domains": {
+    "GM": {
+      "size_bytes": 68719476736,
+      "alignment_bytes": 512,
+      "ports": 2,
+      "description": "Off-chip HBM; 512 B burst alignment."
+    },
+    "L1": {
+      "size_bytes": 524288,
+      "alignment_bytes": 32,
+      "size_alignment_bytes": 32,
+      "stride_alignment_bytes": 32,
+      "ports": 2,
+      "description": "Cube-local scratchpad staging GM tiles before MTE1."
+    },
+    "L0A": {
+      "size_bytes": 65536,
+      "alignment_bytes": 512,
+      "size_alignment_bytes": 512,
+      "stride_alignment_bytes": 32,
+      "description": "Cube left-matrix operand buffer, Zz fractal layout; allocations are whole 16x16 fp16 fractals (512 B)."
+    },
+    "L0B": {
+      "size_bytes": 65536,
+      "alignment_bytes": 512,
+      "size_alignment_bytes": 512,
+      "stride_alignment_bytes": 32,
+      "description": "Cube right-matrix operand buffer, Nz fractal layout; allocations are whole 16x16 fp16 fractals (512 B)."
+    },
+    "L0C": {
+      "size_bytes": 131072,
+      "alignment_bytes": 1024,
+      "size_alignment_bytes": 1024,
+      "stride_alignment_bytes": 32,
+      "description": "FP32/INT32 accumulator; 4 B per element, allocations are whole 16x16 fp32 fractals (1024 B)."
+    },
+    "UB": {
+      "size_bytes": 262144,
+      "alignment_bytes": 32,
+      "size_alignment_bytes": 32,
+      "stride_alignment_bytes": 32,
+      "banks": 8,
+      "bank_stride_bytes": 32,
+      "ports": 2,
+      "description": "Unified Buffer: vector scratchpad, 8 banks x 32 B interleave. Physical DaVinci v2 capacity (256 KiB); the 192 KiB value hardcoded in both tools' built-in profiles is a legacy conservative bound superseded here."
+    },
+    "BT": {
+      "size_bytes": 1024,
+      "alignment_bytes": 64,
+      "size_alignment_bytes": 64,
+      "stride_alignment_bytes": 32,
+      "description": "Bias table (fixpipe operand)."
+    },
+    "FB": {
+      "size_bytes": 2048,
+      "alignment_bytes": 128,
+      "size_alignment_bytes": 128,
+      "stride_alignment_bytes": 32,
+      "description": "Fixpipe parameter buffer (quant/dequant scales)."
+    }
+  },
+  "transfer_channels": {
+    "MTE2": {
+      "src": "GM", "dst": "L1",
+      "bandwidth_bytes_per_cycle": 64.0,
+      "base_latency_cycles": 200.0,
+      "min_burst_bytes": 512,
+      "max_outstanding": 8,
+      "description": "GM -> L1 load, optional ND->NZ reformat."
+    },
+    "MTE2_UB": {
+      "src": "GM", "dst": "UB",
+      "bandwidth_bytes_per_cycle": 64.0,
+      "base_latency_cycles": 200.0,
+      "min_burst_bytes": 512,
+      "max_outstanding": 8,
+      "description": "GM -> UB load for Vector-side operands."
+    },
+    "MTE1": {
+      "src": "L1", "dst": "L0A",
+      "bandwidth_bytes_per_cycle": 64.0,
+      "base_latency_cycles": 20.0,
+      "min_burst_bytes": 32,
+      "max_outstanding": 4,
+      "description": "L1 -> L0A/L0B fractal load (LoadData2d/3d)."
+    },
+    "FIXPIPE": {
+      "src": "L0C", "dst": "GM",
+      "bandwidth_bytes_per_cycle": 64.0,
+      "base_latency_cycles": 80.0,
+      "min_burst_bytes": 32,
+      "max_outstanding": 4,
+      "description": "L0C -> GM/UB drain with inline quant/dequant/ReLU."
+    },
+    "MTE3": {
+      "src": "UB", "dst": "GM",
+      "bandwidth_bytes_per_cycle": 64.0,
+      "base_latency_cycles": 150.0,
+      "min_burst_bytes": 512,
+      "max_outstanding": 4,
+      "description": "UB -> GM store."
+    }
+  },
+  "compute_engines": {
+    "cube": {
+      "fractal_shape": {"m0": 16, "n0": 16, "k0": 16},
+      "pipeline_latency_cycles": 16.0,
+      "issue_overhead_cycles": 1.0,
+      "read_bytes_per_cycle": 1024,
+      "dtype_profiles": {
+        "fp16": {"k0": 16, "macs_per_cycle": 4096, "accumulator": "fp32"},
+        "bf16": {"k0": 16, "macs_per_cycle": 4096, "accumulator": "fp32"},
+        "int8": {"k0": 32, "macs_per_cycle": 8192, "accumulator": "int32"},
+        "uint8": {"k0": 32, "macs_per_cycle": 8192, "accumulator": "int32"},
+        "fp32": {"k0": 8, "macs_per_cycle": 1024, "accumulator": "fp32"}
+      }
+    },
+    "vector": {
+      "bytes_per_cycle": 256.0,
+      "register_bytes": 256,
+      "pipeline_latency_cycles": 8.0,
+      "issue_overhead_cycles": 4.0
+    },
+    "scalar": {
+      "pipeline_latency_cycles": 4.0
+    }
+  },
+  "synchronization": {
+    "reserved_event_ids": [6, 7],
+    "max_event_id": 7,
+    "sync_handoff_cycles": 30
+  },
+  "features": []
+}
