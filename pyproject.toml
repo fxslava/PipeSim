@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ascend-pipesim"
+version = "0.1.0"
+description = "Analytical architectural simulator and auto-tiler for Huawei Ascend DaVinci AI Cores"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "ascend-pipesim contributors" }]
+keywords = ["ascend", "davinci", "npu", "tiling", "roofline", "ascend-c"]
+classifiers = [
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: System :: Hardware",
+    "Topic :: Scientific/Engineering",
+]
+dependencies = []
+
+[project.optional-dependencies]
+fast = ["numpy>=1.23"]
+dev = ["pytest>=7.0", "numpy>=1.23"]
+
+[project.scripts]
+npu-pipesim = "ascend_pipesim.cli:main"
+ascend-pipesim = "ascend_pipesim.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+addopts = "-q"
