@@ -5,9 +5,12 @@ Two ways in, one payload out.
 Command line::
 
     npu-pipesim probe --arch ascend910b --gemm 2048,2048,4096 \\
-        --tile 128,128,64 --subtile 64,64,32 --buffers double
+        --tile 128,128,64 --subtile 64,64,32 --buffers double \\
+        --dtype fp16 --stationary m
     npu-pipesim autotile --arch ascend910b --gemm 4096,4096,8192 \\
         --dtype fp16 --topk 3
+    npu-pipesim codegen --arch ascend910b --gemm 1000,512,1024 \\
+        --tile 128,128,64 --subtile 64,64,32 --outdir generated/
 
 Sub-process JSON RPC (one request per line on stdin, one reply per line on
 stdout, so an agent can keep a single warm process)::
@@ -17,6 +20,7 @@ stdout, so an agent can keep a single warm process)::
     {"id": 1, "ok": true, "result": {...}}
 
 Output defaults to JSON because the primary consumer is an LLM agent; pass
+``--pretty`` for indented output, ``--compact`` for single-line JSON, and
 ``--format text`` for a human-readable rendering.
 """
 
@@ -26,9 +30,11 @@ import argparse
 import json
 import sys
 from dataclasses import replace
+from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, TextIO
 
 from .autotiler import AutotileOptions, AutotileResult, autotile
+from .codegen import KernelBundle, synthesize_kernel
 from .dsl import (
     AlgorithmFlow,
     BufferPlan,
@@ -48,7 +54,14 @@ from .topology import (
     list_architectures,
 )
 
-__all__ = ["main", "build_parser", "run_probe", "run_autotile", "serve_rpc"]
+__all__ = [
+    "main",
+    "build_parser",
+    "run_probe",
+    "run_autotile",
+    "run_codegen",
+    "serve_rpc",
+]
 
 EXIT_OK = 0
 EXIT_INFEASIBLE = 1
@@ -149,6 +162,16 @@ def _epilogue(args: argparse.Namespace) -> tuple[EpilogueOp, ...]:
     return tuple(ops)
 
 
+def _stationary_loop_order(args: argparse.Namespace) -> Optional[LoopOrder]:
+    """--stationary m keeps the M-side operand (A) resident: loop M first."""
+    stationary = getattr(args, "stationary", None)
+    if stationary == "m":
+        return LoopOrder.M_FIRST
+    if stationary == "n":
+        return LoopOrder.N_FIRST
+    return None
+
+
 def _build_flow(args: argparse.Namespace) -> AlgorithmFlow:
     """Assemble an :class:`AlgorithmFlow` from parsed CLI arguments."""
     m, n, k = args.gemm
@@ -163,6 +186,7 @@ def _build_flow(args: argparse.Namespace) -> AlgorithmFlow:
     subtile = args.subtile or (
         min(tile[0], 64), min(tile[1], 64), min(tile[2], 32)
     )
+    loop_order = _stationary_loop_order(args) or LoopOrder(args.loop_order)
     return AlgorithmFlow.gemm(
         m=m, n=n, k=k,
         tile=tile, subtile=subtile,
@@ -170,7 +194,7 @@ def _build_flow(args: argparse.Namespace) -> AlgorithmFlow:
         out_dtype=args.out_dtype,
         batch=args.batch,
         buffers=_buffer_plan(args),
-        loop_order=LoopOrder(args.loop_order),
+        loop_order=loop_order,
         k_position=KPosition(args.k_position),
         output_path=out_path,
         epilogue=epilogue,
@@ -179,6 +203,15 @@ def _build_flow(args: argparse.Namespace) -> AlgorithmFlow:
         cores=args.cores,
         name=args.name,
     )
+
+
+def _json_payload(args: argparse.Namespace, payload: Any) -> str:
+    """Serialise JSON: indented by default or with --pretty, tight with
+    --compact alone."""
+    compact = getattr(args, "compact", False) and not getattr(
+        args, "pretty", False
+    )
+    return json.dumps(payload, indent=None if compact else 2)
 
 
 # ---------------------------------------------------------------------------
@@ -305,9 +338,7 @@ def run_probe(args: argparse.Namespace) -> tuple[int, str]:
     if args.format == "text":
         payload = _render_probe_text(report)
     else:
-        payload = json.dumps(
-            report.to_dict(), indent=None if args.compact else 2
-        )
+        payload = _json_payload(args, report.to_dict())
     code = (
         EXIT_INFEASIBLE if (args.strict and not report.is_valid) else EXIT_OK
     )
@@ -318,11 +349,13 @@ def run_autotile(args: argparse.Namespace) -> tuple[int, str]:
     """Sweep the tile space and rank the survivors."""
     arch = _resolve_architecture(args)
     template = _build_flow(args)
-    orders = (
-        tuple(LoopOrder(o) for o in args.loop_orders)
-        if args.loop_orders
-        else (LoopOrder.M_FIRST, LoopOrder.N_FIRST)
-    )
+    stationary = _stationary_loop_order(args)
+    if stationary is not None:
+        orders: tuple[LoopOrder, ...] = (stationary,)
+    elif args.loop_orders:
+        orders = tuple(LoopOrder(o) for o in args.loop_orders)
+    else:
+        orders = (LoopOrder.M_FIRST, LoopOrder.N_FIRST)
     plans = tuple(BufferPlan.named(b) for b in (args.buffer_plans or ["double"]))
     options = AutotileOptions(
         topk=args.topk,
@@ -339,12 +372,53 @@ def run_autotile(args: argparse.Namespace) -> tuple[int, str]:
     if args.format == "text":
         payload = _render_autotile_text(result)
     else:
-        payload = json.dumps(
-            result.to_dict(full_report=args.full_report),
-            indent=None if args.compact else 2,
+        payload = _json_payload(
+            args, result.to_dict(full_report=args.full_report)
         )
     code = (
         EXIT_INFEASIBLE if (args.strict and result.best is None) else EXIT_OK
+    )
+    return code, payload
+
+
+def run_codegen(args: argparse.Namespace) -> tuple[int, str]:
+    """Evaluate a tiling and synthesise Ascend C kernel sources for it."""
+    arch = _resolve_architecture(args)
+    flow = _build_flow(args)
+    report = evaluate(flow, arch, _eval_options(args))
+    bundle = synthesize_kernel(report, flow, arch)
+
+    if args.format == "text":
+        payload = "\n".join(
+            [
+                bundle.summary(),
+                "",
+                "// ------------------- kernel_tiling.h -------------------",
+                bundle.kernel_tiling_h,
+                "// ---------------------- kernel.cpp ---------------------",
+                bundle.kernel_cpp,
+            ]
+        )
+    else:
+        outdir = getattr(args, "outdir", None)
+        if outdir:
+            written = [str(p) for p in bundle.write(outdir)]
+            payload = _json_payload(
+                args,
+                {
+                    "written": written,
+                    "outdir": str(Path(outdir)),
+                    "meta": bundle.meta,
+                    "buffers": {
+                        k: v.to_dict() for k, v in bundle.buffers.items()
+                    },
+                },
+            )
+        else:
+            payload = _json_payload(args, bundle.to_dict())
+
+    code = (
+        EXIT_INFEASIBLE if (args.strict and not report.is_valid) else EXIT_OK
     )
     return code, payload
 
@@ -386,9 +460,7 @@ def run_archs(args: argparse.Namespace) -> tuple[int, str]:
             if arch.notes:
                 lines.append(f"  notes: {arch.notes}")
             return EXIT_OK, "\n".join(lines)
-        return EXIT_OK, json.dumps(
-            arch.to_dict(), indent=None if args.compact else 2
-        )
+        return EXIT_OK, _json_payload(args, arch.to_dict())
 
     names = list_architectures()
     if args.format == "text":
@@ -403,13 +475,8 @@ def run_archs(args: argparse.Namespace) -> tuple[int, str]:
                 f"{arch.family}"
             )
         return EXIT_OK, "\n".join(["built-in manifests:", *rows])
-    return EXIT_OK, json.dumps(
-        {
-            "architectures": [
-                get_architecture(n).to_dict() for n in names
-            ]
-        },
-        indent=None if args.compact else 2,
+    return EXIT_OK, _json_payload(
+        args, {"architectures": [get_architecture(n).to_dict() for n in names]}
     )
 
 
@@ -427,11 +494,12 @@ def _rpc_namespace(params: Mapping[str, Any]) -> argparse.Namespace:
         "buffers": "double",
         "l1_depth": None, "l0_depth": None, "l0c_depth": None,
         "ub_depth": None,
-        "loop_order": "M_first", "k_position": "inner",
+        "loop_order": "M_first", "k_position": "inner", "stationary": None,
         "dequant": False, "bias": False, "relu": False,
         "epilogue_on_vector": False,
         "transpose_a": False, "transpose_b": False,
-        "name": "flow", "format": "json", "compact": True, "strict": False,
+        "name": "flow", "format": "json", "compact": True, "pretty": False,
+        "strict": False, "outdir": None,
         "no_l2": False, "no_hbm_contention": False, "no_hints": False,
         "pipe_bw": [], "pipe_latency": [], "pool_bytes": [],
         "frequency": None,
@@ -462,11 +530,13 @@ def _rpc_dispatch(method: str, params: Mapping[str, Any]) -> Any:
         return evaluate(_build_flow(args), arch, _eval_options(args)).to_dict()
     if method == "autotile":
         arch = _resolve_architecture(args)
-        orders = (
-            tuple(LoopOrder(o) for o in args.loop_orders)
-            if args.loop_orders
-            else (LoopOrder.M_FIRST, LoopOrder.N_FIRST)
-        )
+        stationary = _stationary_loop_order(args)
+        if stationary is not None:
+            orders: tuple[LoopOrder, ...] = (stationary,)
+        elif args.loop_orders:
+            orders = tuple(LoopOrder(o) for o in args.loop_orders)
+        else:
+            orders = (LoopOrder.M_FIRST, LoopOrder.N_FIRST)
         plans = tuple(
             BufferPlan.named(b) for b in (args.buffer_plans or ["double"])
         )
@@ -484,6 +554,11 @@ def _rpc_dispatch(method: str, params: Mapping[str, Any]) -> Any:
         return autotile(_build_flow(args), arch, options).to_dict(
             full_report=args.full_report
         )
+    if method == "codegen":
+        arch = _resolve_architecture(args)
+        flow = _build_flow(args)
+        report = evaluate(flow, arch, _eval_options(args))
+        return synthesize_kernel(report, flow, arch).to_dict()
     if method == "architectures":
         return {"architectures": list_architectures()}
     if method == "describe_arch":
@@ -494,7 +569,7 @@ def _rpc_dispatch(method: str, params: Mapping[str, Any]) -> Any:
         return evaluate(flow, arch, _eval_options(args)).to_dict()
     raise ValueError(
         f"unknown method {method!r}; expected one of probe, autotile, "
-        f"architectures, describe_arch, evaluate_flow"
+        f"codegen, architectures, describe_arch, evaluate_flow"
     )
 
 
@@ -605,6 +680,12 @@ def _add_staging_arguments(parser: argparse.ArgumentParser) -> None:
         help="which spatial dimension carries the outermost tile loop",
     )
     group.add_argument(
+        "--stationary", choices=["m", "n"], default=None,
+        help="operand that stays resident across the inner spatial sweep: "
+             "m keeps the M-side operand (A) resident => M_first, n keeps B "
+             "resident => N_first; overrides --loop-order",
+    )
+    group.add_argument(
         "--k-position", default="inner", choices=["inner", "outer"],
         help="inner keeps the accumulator in L0C; outer re-materialises C",
     )
@@ -618,6 +699,10 @@ def _add_output_arguments(parser: argparse.ArgumentParser) -> None:
     )
     group.add_argument(
         "--compact", action="store_true", help="single-line JSON"
+    )
+    group.add_argument(
+        "--pretty", action="store_true",
+        help="pretty-print JSON with indent=2 (the default; overrides --compact)",
     )
     group.add_argument(
         "-o", "--output", metavar="PATH", help="write to a file instead of stdout"
@@ -650,9 +735,12 @@ def build_parser() -> argparse.ArgumentParser:
         epilog=(
             "examples:\n"
             "  npu-pipesim probe --arch ascend910b --gemm 2048,2048,4096 "
-            "--tile 128,128,64 --subtile 64,64,32 --buffers double\n"
+            "--tile 128,128,64 --subtile 64,64,32 --buffers double "
+            "--stationary m\n"
             "  npu-pipesim autotile --arch ascend910b --gemm 4096,4096,8192 "
             "--dtype fp16 --topk 3\n"
+            "  npu-pipesim codegen --arch ascend910b --gemm 1000,512,1024 "
+            "--tile 128,128,64 --outdir generated/\n"
             "  npu-pipesim archs --format text\n"
             "  npu-pipesim rpc  < requests.jsonl\n"
         ),
@@ -716,6 +804,29 @@ def build_parser() -> argparse.ArgumentParser:
     _add_arch_arguments(auto)
     _add_output_arguments(auto)
     auto.set_defaults(func=run_autotile)
+
+    gen = sub.add_parser(
+        "codegen",
+        help="evaluate a tiling and synthesise Ascend C kernel sources",
+    )
+    _add_problem_arguments(gen)
+    gen.add_argument(
+        "--tile", type=_int_triple, metavar="M,N,K",
+        help="outer L1 tile (default 128,128,64)",
+    )
+    gen.add_argument(
+        "--subtile", type=_int_triple, metavar="m,n,k",
+        help="inner L0 subtile (default: half the tile)",
+    )
+    _add_staging_arguments(gen)
+    _add_arch_arguments(gen)
+    _add_output_arguments(gen)
+    gen.add_argument(
+        "--outdir", metavar="DIR",
+        help="write kernel.cpp and kernel_tiling.h into DIR instead of "
+             "emitting the sources as JSON",
+    )
+    gen.set_defaults(func=run_codegen)
 
     archs = sub.add_parser("archs", help="list or describe hardware manifests")
     archs.add_argument("name", nargs="?", help="manifest to describe in full")

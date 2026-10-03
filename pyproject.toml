@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ascend-pipesim"
-version = "0.1.0"
+version = "0.2.0"
 description = "Analytical architectural simulator and auto-tiler for Huawei Ascend DaVinci AI Cores"
 readme = "README.md"
 requires-python = ">=3.10"
