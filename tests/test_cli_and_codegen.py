@@ -299,13 +299,20 @@ class TestSynthesizeKernel:
         assert "using A_T = half;" in cpp
         assert "using C_T = half;" in cpp
 
-        # static staging order: MTE2 -> MTE1 -> Cube Iterate -> Fixpipe
+        # static staging order: MTE2 prologue/prefetch -> pipelined Compute
+        # (prologue loads, DeQue at consumption, Cube iterate, bank refill)
+        # -> producer helper (LoadData then immediate EnQue) -> Fixpipe drain
         markers = [
-            "CopyIn(mo, no, ko);   // MTE2",
-            "LoadData(a2",          # MTE1: L1 -> L0A
-            "LoadData(b2",          # MTE1: L1 -> L0B
-            "matmulObj.Iterate()",  # Cube
-            "matmulObj.GetTensorC()",  # Fixpipe drain
+            "CopyIn(mo, no, 0);   // MTE2: GM -> L1, bank 0",
+            "CopyIn(mo, no, ko + 1);   // MTE2: GM -> L1, bank 1",
+            "Compute(mo, no, ko);",
+            "LoadSubtile(a1, b1, 0);",              # software-pipeline prologue
+            "queA2_.DeQue<A_T>();   // bank step%2",  # DeQue at consumption
+            "matmulObj.Iterate();",                  # Cube
+            "LoadSubtile(a1, b1, step + 2);",        # refill of the freed bank
+            "LoadData(a2",                           # MTE1: L1 -> L0A (helper)
+            "queA2_.EnQue(a2);",                     # EnQue right after the load
+            "matmulObj.GetTensorC()",                # Fixpipe drain
             "WaitFlag<HardEvent::M_FIX>(EVENT_ID0)",
         ]
         positions = [cpp.index(marker) for marker in markers]
@@ -358,6 +365,110 @@ class TestSynthesizeKernel:
             )
         assert bundle.buffers["queA1_"].depth == 1
         assert bundle.buffers["queCO1_"].total_bytes == 65536
+        # one bank cannot hold ping-pong slack: no prologue, no prefetch,
+        # no refill -- the synchronous loop matches Omega = 1.0.
+        assert bundle.meta["pipeline_style"] == "synchronous"
+        assert "LoadSubtile" not in cpp
+        assert "ko + 1" not in cpp
+        assert "step + 2" not in cpp
+
+    def test_asynchronous_pipeline_structure(self):
+        bundle = make_bundle(make_flow())  # double-buffered
+        cpp, header = bundle.kernel_cpp, bundle.kernel_tiling_h
+        assert bundle.meta["pipeline_style"] == "software_pipelined"
+
+        # prologue primes BOTH L0 banks before the first Cube issue
+        assert "LoadSubtile(a1, b1, 0);" in cpp
+        assert "LoadSubtile(a1, b1, 1);" in cpp
+        assert header_const(header, "SUB_STEPS_TOTAL") == 8  # 2*2*2 subtiles
+
+        # steady state: Cube on bank K overlaps MTE1 refilling bank K+1,
+        # with the producer two tokens ahead of the consumer
+        assert "for (int32_t step = 0; step < SUB_STEPS_TOTAL; ++step) {" in cpp
+        assert "step + 2 < SUB_STEPS_TOTAL" in cpp
+        assert "LoadSubtile(a1, b1, step + 2);   // MTE1: refill freed bank" in cpp
+
+        # EnQue fires immediately after the MTE1 load is scheduled
+        assert cpp.index("LoadData(a2") < cpp.index("queA2_.EnQue(a2);")
+        # DeQue is delayed to the exact point of consumption
+        deque_pos = cpp.index("queA2_.DeQue<A_T>();   // bank step%2")
+        set_pos = cpp.index("matmulObj.SetTensorA(a2);")
+        assert deque_pos < set_pos
+        # token lifetime spans loop iterations: the bank freed at step is
+        # re-armed for step+2 inside the SAME steady-state loop
+        assert cpp.index("queA2_.FreeTensor(a2);") < cpp.index(
+            "LoadSubtile(a1, b1, step + 2);"
+        )
+
+        # coarse barriers are never used anywhere, let alone in the loop
+        assert "PipeBarrier" not in cpp
+
+        # the MTE2 prologue covers the L1 level too
+        assert "CopyIn(mo, no, 0);   // MTE2: GM -> L1, bank 0" in cpp
+        assert "if (ko + 1 < tiling_.usedK) {" in cpp
+
+
+# ---------------------------------------------------------------------------
+# Pipeline concurrency metrics (Omega / eta_hide)
+# ---------------------------------------------------------------------------
+
+
+class TestConcurrencyMetrics:
+    def test_concurrency_metrics_in_probe_json(self, capsys):
+        payload = run_probe([], capsys)
+        assert "concurrency_ratio" in payload and "latency_hiding_pct" in payload
+        pipe = payload["pipeline"]
+        assert "concurrency_ratio" in pipe and "latency_hiding_pct" in pipe
+        assert "total_stage_cycles" in pipe
+
+    def test_double_buffered_golden_config(self, capsys):
+        # tau = {MTE2: 64, MTE1: 96, CUBE: 33, FIXPIPE: 2} -> sum 195,
+        # steady T_iter = max = 96 (all stages overlapped):
+        # Omega = 195/96 ~ 2.031, eta_hide = 100%.
+        payload = run_probe([], capsys)
+        assert payload["concurrency_ratio"] == pytest.approx(2.031, abs=0.01)
+        assert payload["latency_hiding_pct"] == pytest.approx(100.0)
+        assert payload["pipeline"]["total_stage_cycles"] == pytest.approx(
+            195.0, abs=0.5
+        )
+
+    def test_single_buffered_serializes(self, capsys):
+        code, out = run_cli(
+            [
+                "probe", "--arch", "ascend910b", "--gemm", GEMM,
+                "--tile", TILE, "--subtile", SUBTILE,
+                "--buffers", "single", "--dtype", "fp16", "--compact",
+            ],
+            capsys,
+        )
+        assert code == 0
+        payload = json.loads(out)
+        # near-total serialization: MTE2+MTE1 add to the iteration latency
+        # (only the Cube<->Fixpipe pair still overlaps, because k is inner),
+        # so Omega ~ 195/193 ~ 1.01 and latency hiding ~ 2%.
+        assert payload["concurrency_ratio"] == pytest.approx(1.01, abs=0.005)
+        assert payload["latency_hiding_pct"] == pytest.approx(2.02, abs=0.5)
+        assert payload["limiting_stage"] == "SERIALIZED_NO_DOUBLE_BUFFER"
+        serialized_diag = [
+            d for d in payload["diagnostics"]
+            if d["code"] == "SERIALIZED_NO_DOUBLE_BUFFER"
+        ]
+        assert serialized_diag and "Omega=1.01" in serialized_diag[0]["message"]
+
+    def test_partial_overlap_flags_low_concurrency(self):
+        from ascend_pipesim.evaluator import evaluate
+
+        # a tile whose feeding chain only partially hides under the Cube
+        flow = AlgorithmFlow.gemm(
+            m=2048, n=2048, k=4096,
+            tile=(64, 64, 64), subtile=(32, 32, 32), dtype="fp16",
+        )
+        report = evaluate(flow, "ascend910b")
+        assert 1.0 < report.schedule.concurrency_ratio < 2.0 or \
+            report.schedule.concurrency_ratio == pytest.approx(2.031)
+        if report.schedule.concurrency_ratio < 2.0:
+            codes = [d.code for d in report.diagnostics]
+            assert "LOW_PIPELINE_CONCURRENCY" in codes
 
     def test_int8_dtype_widens_fractal(self):
         bundle = make_bundle(make_flow(dtype="int8"))

@@ -273,12 +273,55 @@ class PipelineSchedule:
                 return st
         raise KeyError(name)
 
+    # -- concurrency metrics ------------------------------------------------
+    @property
+    def total_stage_cycles(self) -> float:
+        """Sum of all per-step stage service times, ``sum(tau_u)``."""
+        return sum(s.cycles_per_step for s in self.stages)
+
+    @property
+    def bottleneck_stage_cycles(self) -> float:
+        """Service time of the widest stage, ``max(tau_u)``."""
+        return max((s.cycles_per_step for s in self.stages), default=0.0)
+
+    @property
+    def concurrency_ratio(self) -> float:
+        """Pipeline concurrency factor ``Omega = sum(tau_u) / T_iter``.
+
+        ``T_iter`` is the modelled steady-state iteration latency.  Under
+        total serialization the stages add, ``T_iter = sum(tau_u)`` and
+        ``Omega = 1.0`` (the PIPE_SERIALIZATION regime); under perfect
+        double-buffered overlap ``T_iter = max(tau_u)`` and ``Omega``
+        reduces to ``sum(tau_u) / max(tau_u)``, so ``Omega > 2.0`` certifies
+        that three or more stages are concurrently active.
+        """
+        return _safe_div(self.total_stage_cycles,
+                         self.steady_state_cycles_per_step)
+
+    @property
+    def latency_hiding_pct(self) -> float:
+        """Latency-hiding efficiency ``eta_hide`` in percent.
+
+        ``eta_hide = (sum(tau_u) - T_iter) / sum_{u != bottleneck}(tau_u)``.
+        The numerator is the per-iteration time actually removed by overlap;
+        the denominator is the most it could remove (everything except the
+        bottleneck, which can never hide behind itself).  100% means every
+        non-bottleneck stage is fully hidden behind the critical one; 0%
+        means the stages serialize.
+        """
+        numerator = self.total_stage_cycles - self.steady_state_cycles_per_step
+        denominator = self.total_stage_cycles - self.bottleneck_stage_cycles
+        return 100.0 * _safe_div(numerator, denominator)
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             "steps": self.steps,
             "steady_state_cycles_per_step": round(
                 self.steady_state_cycles_per_step, 4
             ),
+            "total_stage_cycles": round(self.total_stage_cycles, 4),
+            "concurrency_ratio": round(self.concurrency_ratio, 3),
+            "latency_hiding_pct": round(self.latency_hiding_pct, 2),
             "fill_cycles": round(self.fill_cycles, 1),
             "drain_cycles": round(self.drain_cycles, 1),
             "total_cycles": round(self.total_cycles, 1),
@@ -344,6 +387,8 @@ class EvaluationReport:
             "is_valid": self.is_valid,
             "cube_utilization_pct": round(self.cube_utilization_pct, 2),
             "limiting_stage": self.limiting_stage,
+            "concurrency_ratio": round(self.schedule.concurrency_ratio, 3),
+            "latency_hiding_pct": round(self.schedule.latency_hiding_pct, 2),
             "fractal_efficiency": round(self.fractal_efficiency, 4),
             "tail_penalty_pct": round(100.0 * (1.0 - self.fractal_efficiency), 2),
             "tile": self.tile,
@@ -1149,7 +1194,9 @@ def _diagnostics(
             Diagnostic(
                 "SERIALIZED_NO_DOUBLE_BUFFER",
                 f"Stages {depth1} run at depth 1, so their time adds to every "
-                "iteration instead of overlapping.",
+                f"iteration instead of overlapping: concurrency ratio "
+                f"Omega={schedule.concurrency_ratio:.2f} (1.0 == total "
+                "serialization).",
                 "Set l1_depth=2 and l0_depth=2 (TQue<..., 2>) if the SRAM "
                 "budget allows; this is usually the single largest win.",
                 impact="high",
@@ -1164,6 +1211,32 @@ def _diagnostics(
                 "Remaining headroom is fractal padding and pipeline fill; "
                 "only larger problem extents or fewer tails will help.",
                 impact="low",
+            )
+        )
+
+    # Pipeline concurrency gate: Omega < 2.0 means at most two stages are
+    # meaningfully overlapped; flag the partial-overlap regime (the fully
+    # serialized regime is already SERIALIZED_NO_DOUBLE_BUFFER above).
+    if (
+        schedule.limiting_stage != "SERIALIZED_NO_DOUBLE_BUFFER"
+        and schedule.concurrency_ratio < 2.0
+        and schedule.total_stage_cycles > 0
+    ):
+        ratio = schedule.concurrency_ratio
+        out.append(
+            Diagnostic(
+                "LOW_PIPELINE_CONCURRENCY",
+                f"Pipeline concurrency ratio Omega={ratio:.2f} (< 2.0): the "
+                "steady-state iteration latency "
+                f"{schedule.steady_state_cycles_per_step:.1f} cycles exceeds "
+                f"the widest stage {schedule.bottleneck_stage_cycles:.1f} "
+                "cycles, so stages are only partially overlapped "
+                f"(latency hiding {schedule.latency_hiding_pct:.0f}%).",
+                "Rebalance the tiling so feeding stages fit under the "
+                "bottleneck's shadow (grow the tile fed by the critical "
+                "stage), or raise the buffer depth that gates the "
+                "second-widest stage.",
+                impact="medium",
             )
         )
 

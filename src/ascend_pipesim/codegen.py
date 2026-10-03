@@ -422,6 +422,10 @@ def _emit_tiling_header(c: _Ctx) -> str:
     L.append(f"constexpr int32_t SUB_STEPS_M = {c.sub_steps_m};  // ceil(TILE_M / SUB_M)")
     L.append(f"constexpr int32_t SUB_STEPS_N = {c.sub_steps_n};  // ceil(TILE_N / SUB_N)")
     L.append(f"constexpr int32_t SUB_STEPS_K = {c.sub_steps_k};  // ceil(TILE_K / SUB_K)")
+    L.append(
+        f"constexpr int32_t SUB_STEPS_TOTAL = {c.sub_steps_m * c.sub_steps_n * c.sub_steps_k};"
+        f"  // flattened inner software-pipeline length"
+    )
     L.append("")
     L.append("// --- ragged tails (0 when the axis divides exactly) ---------------------")
     L.append(f"constexpr int32_t TAIL_M = {c.tail_m};")
@@ -631,12 +635,49 @@ def _emit_kernel_cpp(c: _Ctx) -> str:
     L.append("    __aicore__ inline void Process() {")
 
     indent = "        "
-    for name in c.outer_nest:
+    for name in c.outer_nest[:-1]:
         axis = name[0].upper()  # mo -> usedM, no -> usedN, ko -> usedK
         L.append(f"{indent}for (int32_t {name} = 0; {name} < tiling_.used{axis}; ++{name}) {{")
         indent += "    "
-    L.append(f"{indent}CopyIn(mo, no, ko);   // MTE2: GM -> L1 (A1/B1, Nd2Nz reformat)")
-    L.append(f"{indent}Compute(mo, no, ko);  // MTE1: L1 -> L0A/L0B, Cube iterate, L0C accumulates")
+    inner = c.outer_nest[-1]
+    inner_axis = inner[0].upper()
+    l1_depth = c.buffers["queA1_"].depth
+
+    if l1_depth >= 2:
+        prologue_args = ", ".join(
+            "0" if name == inner else name for name in ("mo", "no", "ko")
+        )
+        prefetch_args = ", ".join(
+            f"{inner} + 1" if name == inner else name
+            for name in ("mo", "no", "ko")
+        )
+        L.append(f"{indent}// MTE2 prologue: fill L1 ping-pong bank 0 before any compute")
+        L.append(f"{indent}// blocks, so the first Cube issue never waits on GM latency.")
+        L.append(f"{indent}CopyIn({prologue_args});   // MTE2: GM -> L1, bank 0 (Nd2Nz)")
+        L.append(
+            f"{indent}for (int32_t {inner} = 0; {inner} < tiling_.used{inner_axis};"
+            f" ++{inner}) {{"
+        )
+        indent += "    "
+        L.append(f"{indent}// Prefetch the next tile into the alternate L1 bank BEFORE")
+        L.append(f"{indent}// blocking on this tile's Cube work: MTE2 stays one token")
+        L.append(f"{indent}// ahead of the MTE1/Cube consumer chain.")
+        L.append(f"{indent}if ({inner} + 1 < tiling_.used{inner_axis}) {{")
+        L.append(f"{indent}    CopyIn({prefetch_args});   // MTE2: GM -> L1, bank 1")
+        L.append(f"{indent}}}")
+        L.append(f"{indent}Compute(mo, no, ko);  // MTE1 -> L0 ping-pong + Cube iterate")
+    else:
+        L.append(f"{indent}// Single-buffered L1: no prefetch slack exists (one bank), so")
+        L.append(f"{indent}// MTE2 and the consumer chain serialize -- exactly what the")
+        L.append(f"{indent}// simulator reports as concurrency ratio Omega = 1.0.")
+        L.append(
+            f"{indent}for (int32_t {inner} = 0; {inner} < tiling_.used{inner_axis};"
+            f" ++{inner}) {{"
+        )
+        indent += "    "
+        L.append(f"{indent}CopyIn(mo, no, ko);   // MTE2: GM -> L1 (A1/B1, Nd2Nz)")
+        L.append(f"{indent}Compute(mo, no, ko);  // MTE1 -> L0 + Cube iterate")
+
     # Close the innermost loop; the Fixpipe drain runs once per output tile
     # (or once per K step when k_position=outer re-materialises C).
     indent = indent[:-4]
@@ -708,45 +749,111 @@ def _emit_kernel_cpp(c: _Ctx) -> str:
         L.append("        }")
         L.append("")
 
-    sub_indent = "        "
-    for name in c.inner_nest:
-        extent = {"sm": "SUB_STEPS_M", "sn": "SUB_STEPS_N", "sk": "SUB_STEPS_K"}[name]
+    l0_depth = c.buffers["queA2_"].depth
+    if l0_depth >= 2:
+        L.append("        // ---- Software-pipeline prologue ------------------------------------")
+        L.append("        // Prime BOTH L0 ping-pong banks before the first Cube issue so")
+        L.append("        // the MTE1 latency of sub-tiles 0 and 1 hides behind Cube work.")
+        L.append("        LoadSubtile(a1, b1, 0);")
+        L.append("        if (SUB_STEPS_TOTAL > 1) {")
+        L.append("            LoadSubtile(a1, b1, 1);")
+        L.append("        }")
+        L.append("")
+        L.append("        // ---- Steady state: Cube on bank K, MTE1 on bank K+1 -----------------")
+        L.append("        // The producer runs two tokens ahead of the consumer: DeQue is")
+        L.append("        // delayed to the exact point of consumption, and each bank freed")
+        L.append("        // by the Cube is immediately re-armed with sub-tile step+2, so")
+        L.append("        // MTE1 issue never idles behind the Cube; no coarse all-pipe")
+        L.append("        // barrier is ever issued inside the steady state.")
+        L.append("        for (int32_t step = 0; step < SUB_STEPS_TOTAL; ++step) {")
+        L.append("            LocalTensor<A_T> a2 = queA2_.DeQue<A_T>();   // bank step%2")
+        L.append("            LocalTensor<B_T> b2 = queB2_.DeQue<B_T>();")
+        L.append("            matmulObj.SetTensorA(a2);")
+        L.append("            matmulObj.SetTensorB(b2);")
+        L.append("            matmulObj.Iterate();   // Cube: L0A x L0B -> L0C, accumulates across sk")
+        L.append("            queA2_.FreeTensor(a2);   // release this bank for sub-tile step+2")
+        L.append("            queB2_.FreeTensor(b2);")
+        L.append("            if (step + 2 < SUB_STEPS_TOTAL) {")
+        L.append("                LoadSubtile(a1, b1, step + 2);   // MTE1: refill freed bank")
+        L.append("            }")
+        L.append("        }")
+        L.append("        queA1_.FreeTensor(a1);")
+        L.append("        queB1_.FreeTensor(b1);")
+        L.append("    }")
+        L.append("")
+        L.append("    // ---- MTE1 producer step: Alloc -> LoadData -> EnQue -------------------")
+        L.append("    // EnQue fires immediately after the load is scheduled; with depth-2")
+        L.append("    // banks the consumer (DeQue in the steady-state loop) stays two")
+        L.append("    // tokens behind, which is the maximum slack the queues can hold.")
+        L.append("    __aicore__ inline void LoadSubtile(const LocalTensor<A_T>& a1,")
+        L.append("                                       const LocalTensor<B_T>& b1,")
+        L.append("                                       int32_t step) {")
+        nest_names = c.inner_nest  # e.g. ["sk", "sm", "sn"]
+        extents = {"sm": "SUB_STEPS_M", "sn": "SUB_STEPS_N", "sk": "SUB_STEPS_K"}
+        mid_e, in_e = extents[nest_names[1]], extents[nest_names[2]]
         L.append(
-            f"{sub_indent}for (int32_t {name} = 0; {name} < {extent}; ++{name}) {{"
+            f"        // Decode the flattened step index into the "
+            f"({', '.join(nest_names)}) sub-tile grid."
         )
-        sub_indent += "    "
-    L.append(f"{sub_indent}// MTE1: L1 -> L0A, zZ fractal load of the SUB_M x SUB_K block.")
-    L.append(f"{sub_indent}LocalTensor<A_T> a2 = queA2_.AllocTensor<A_T>();")
-    L.append(f"{sub_indent}LoadData2dParams ldA;")
-    L.append(f"{sub_indent}ldA.repeat = (SUB_M_PAD / FRACTAL_M0) * (SUB_K_PAD / FRACTAL_K0);")
-    L.append(f"{sub_indent}ldA.srcGap = 0;")
-    L.append(f"{sub_indent}ldA.dstGap = 0;")
-    L.append(f"{sub_indent}LoadData(a2, a1[A1BlockOffset(sm, sk)], ldA);")
-    L.append(f"{sub_indent}queA2_.EnQue(a2);")
-    L.append("")
-    L.append(f"{sub_indent}// MTE1: L1 -> L0B, nZ fractal load of the SUB_K x SUB_N block.")
-    L.append(f"{sub_indent}LocalTensor<B_T> b2 = queB2_.AllocTensor<B_T>();")
-    L.append(f"{sub_indent}LoadData2dParams ldB;")
-    L.append(f"{sub_indent}ldB.repeat = (SUB_N_PAD / FRACTAL_N0) * (SUB_K_PAD / FRACTAL_K0);")
-    L.append(f"{sub_indent}ldB.srcGap = 0;")
-    L.append(f"{sub_indent}ldB.dstGap = 0;")
-    L.append(f"{sub_indent}LoadData(b2, b1[B1BlockOffset(sk, sn)], ldB);")
-    L.append(f"{sub_indent}queB2_.EnQue(b2);")
-    L.append("")
-    L.append(f"{sub_indent}// Cube: one Mmad issue per subtile pair; L0C accumulates across sk.")
-    L.append(f"{sub_indent}matmulObj.SetTensorA(queA2_.DeQue<A_T>());")
-    L.append(f"{sub_indent}matmulObj.SetTensorB(queB2_.DeQue<B_T>());")
-    L.append(f"{sub_indent}matmulObj.Iterate();")
-    L.append(f"{sub_indent}queA2_.FreeTensor(a2);")
-    L.append(f"{sub_indent}queB2_.FreeTensor(b2);")
-
-    for _ in c.inner_nest:
-        sub_indent = sub_indent[:-4]
-        L.append(f"{sub_indent}}}")
-
-    L.append("        queA1_.FreeTensor(a1);")
-    L.append("        queB1_.FreeTensor(b1);")
-    L.append("    }")
+        L.append(f"        const int32_t {nest_names[0]} = step / ({mid_e} * {in_e});")
+        L.append(f"        const int32_t stepRem = step % ({mid_e} * {in_e});")
+        L.append(f"        const int32_t {nest_names[1]} = stepRem / {in_e};")
+        L.append(f"        const int32_t {nest_names[2]} = stepRem % {in_e};")
+        L.append("        // MTE1: L1 -> L0A, zZ fractal load of the SUB_M x SUB_K block.")
+        L.append("        LocalTensor<A_T> a2 = queA2_.AllocTensor<A_T>();")
+        L.append("        LoadData2dParams ldA;")
+        L.append("        ldA.repeat = (SUB_M_PAD / FRACTAL_M0) * (SUB_K_PAD / FRACTAL_K0);")
+        L.append("        ldA.srcGap = 0;")
+        L.append("        ldA.dstGap = 0;")
+        L.append("        LoadData(a2, a1[A1BlockOffset(sm, sk)], ldA);")
+        L.append("        queA2_.EnQue(a2);")
+        L.append("        // MTE1: L1 -> L0B, nZ fractal load of the SUB_K x SUB_N block.")
+        L.append("        LocalTensor<B_T> b2 = queB2_.AllocTensor<B_T>();")
+        L.append("        LoadData2dParams ldB;")
+        L.append("        ldB.repeat = (SUB_N_PAD / FRACTAL_N0) * (SUB_K_PAD / FRACTAL_K0);")
+        L.append("        ldB.srcGap = 0;")
+        L.append("        ldB.dstGap = 0;")
+        L.append("        LoadData(b2, b1[B1BlockOffset(sk, sn)], ldB);")
+        L.append("        queB2_.EnQue(b2);")
+        L.append("    }")
+    else:
+        L.append("        // Single-buffered L0: one bank cannot hold producer/consumer")
+        L.append("        // slack, so each sub-tile load synchronizes with its own")
+        L.append("        // consumption (concurrency ratio Omega = 1.0 in the simulator).")
+        L.append("        // Upgrade to --buffers double for overlapped issue.")
+        sub_indent = "        "
+        for name in c.inner_nest:
+            extent = {"sm": "SUB_STEPS_M", "sn": "SUB_STEPS_N", "sk": "SUB_STEPS_K"}[name]
+            L.append(
+                f"{sub_indent}for (int32_t {name} = 0; {name} < {extent}; ++{name}) {{"
+            )
+            sub_indent += "    "
+        L.append(f"{sub_indent}// MTE1: L1 -> L0A/L0B, then immediate synchronous consumption.")
+        L.append(f"{sub_indent}LocalTensor<A_T> a2 = queA2_.AllocTensor<A_T>();")
+        L.append(f"{sub_indent}LoadData2dParams ldA;")
+        L.append(f"{sub_indent}ldA.repeat = (SUB_M_PAD / FRACTAL_M0) * (SUB_K_PAD / FRACTAL_K0);")
+        L.append(f"{sub_indent}ldA.srcGap = 0;")
+        L.append(f"{sub_indent}ldA.dstGap = 0;")
+        L.append(f"{sub_indent}LoadData(a2, a1[A1BlockOffset(sm, sk)], ldA);")
+        L.append(f"{sub_indent}queA2_.EnQue(a2);")
+        L.append(f"{sub_indent}LocalTensor<B_T> b2 = queB2_.AllocTensor<B_T>();")
+        L.append(f"{sub_indent}LoadData2dParams ldB;")
+        L.append(f"{sub_indent}ldB.repeat = (SUB_N_PAD / FRACTAL_N0) * (SUB_K_PAD / FRACTAL_K0);")
+        L.append(f"{sub_indent}ldB.srcGap = 0;")
+        L.append(f"{sub_indent}ldB.dstGap = 0;")
+        L.append(f"{sub_indent}LoadData(b2, b1[B1BlockOffset(sk, sn)], ldB);")
+        L.append(f"{sub_indent}queB2_.EnQue(b2);")
+        L.append(f"{sub_indent}matmulObj.SetTensorA(queA2_.DeQue<A_T>());")
+        L.append(f"{sub_indent}matmulObj.SetTensorB(queB2_.DeQue<B_T>());")
+        L.append(f"{sub_indent}matmulObj.Iterate();   // Cube: L0A x L0B -> L0C")
+        L.append(f"{sub_indent}queA2_.FreeTensor(a2);")
+        L.append(f"{sub_indent}queB2_.FreeTensor(b2);")
+        for _ in c.inner_nest:
+            sub_indent = sub_indent[:-4]
+            L.append(f"{sub_indent}}}")
+        L.append("        queA1_.FreeTensor(a1);")
+        L.append("        queB1_.FreeTensor(b1);")
+        L.append("    }")
     L.append("")
     L.append("    // ---- Fixpipe: L0C -> GM -----------------------------------------------")
     L.append("    __aicore__ inline void CopyOut(int32_t mo, int32_t no) {")
@@ -891,6 +998,10 @@ def synthesize_kernel(
         "tile": c.flow.tile.to_dict(),
         "loop_order": c.flow.loop_order.value,
         "k_position": c.flow.k_position.value,
+        "pipeline_style": (
+            "software_pipelined" if c.buffers["queA2_"].depth >= 2
+            and c.buffers["queA1_"].depth >= 2 else "synchronous"
+        ),
         "outer_loop_nest": list(c.outer_nest),
         "inner_loop_nest": list(c.inner_nest),
         "settail_required": c.settail_required,

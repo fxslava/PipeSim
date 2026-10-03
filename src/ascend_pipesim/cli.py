@@ -269,6 +269,11 @@ def _render_probe_text(report: EvaluationReport) -> str:
         f"{sched.drain_cycles:.0f} drain"
     )
     lines.append(
+        f"  concurrency Omega={sched.concurrency_ratio:.2f} "
+        f"(1.0 = serialized), latency hiding "
+        f"{sched.latency_hiding_pct:.1f}%"
+    )
+    lines.append(
         f"  limiting stage : {sched.limiting_stage} "
         f"(next: {sched.secondary_stage}, slack {sched.slack_pct:.1f}%)"
     )
