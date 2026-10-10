@@ -153,15 +153,15 @@ class TensorSpec:
         return math.prod(self.shape)
 
     @property
-    def itemsize(self) -> int:
+    def itemsize(self) -> float:
         return self.dtype.size_bytes
 
     @property
-    def nbytes(self) -> int:
+    def nbytes(self) -> float:
         return self.num_elements * self.itemsize
 
     @property
-    def inner_stride_bytes(self) -> int:
+    def inner_stride_bytes(self) -> float:
         """Contiguous run length of the fastest-varying axis, in bytes."""
         return self.shape[-1] * self.itemsize
 

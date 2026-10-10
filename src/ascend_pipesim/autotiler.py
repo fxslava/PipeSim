@@ -3,9 +3,9 @@
 The search is a plain nested enumeration, but ordered so that the cheapest,
 most selective constraint runs outermost:
 
-1. ``(tile_m, tile_n)`` fixes the L0C accumulator footprint.  L0C is only
-   128 KiB of FP32, so this single test eliminates the large majority of the
-   grid before anything else is computed.
+1. ``(tile_m, tile_n)`` fixes the L0C accumulator footprint.  Its capacity
+   comes from the selected architecture (128 KiB on older targets, 256 KiB
+   on Ascend 950), so this test eliminates oversized tiles early.
 2. ``tile_k`` then fixes the L1 footprint.
 3. ``(sub_m, sub_n, sub_k)`` fixes L0A/L0B.
 4. Whatever survives goes to the full three-tier :func:`~evaluator.evaluate`.
@@ -308,7 +308,7 @@ def _outer_grid(
     tile_ks: Sequence[int],
     *,
     k0: int,
-    itemsize: int,
+    itemsize: float,
     l0c_capacity: int,
     l1_capacity: int,
     l1_depth: int,

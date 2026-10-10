@@ -76,22 +76,27 @@ class DType(str, Enum):
     FP16 = "fp16"
     BF16 = "bf16"
     FP8 = "fp8"
+    MXFP8 = "mxfp8"
+    HIF8 = "hif8"
+    MXFP4 = "mxfp4"
     INT32 = "int32"
     INT16 = "int16"
     INT8 = "int8"
     UINT8 = "uint8"
 
     @property
-    def size_bytes(self) -> int:
+    def size_bytes(self) -> float:
         return _DTYPE_SIZE[self]
 
     @property
     def is_float(self) -> bool:
-        return self in (DType.FP32, DType.FP16, DType.BF16, DType.FP8)
+        return self in (DType.FP32, DType.FP16, DType.BF16, DType.FP8,
+                        DType.MXFP8, DType.HIF8, DType.MXFP4)
 
     @property
     def is_quantized(self) -> bool:
-        return self in (DType.INT8, DType.UINT8, DType.FP8)
+        return self in (DType.INT8, DType.UINT8, DType.FP8,
+                        DType.MXFP8, DType.HIF8, DType.MXFP4)
 
     @classmethod
     def parse(cls, value: "str | DType") -> "DType":
@@ -108,11 +113,14 @@ class DType(str, Enum):
             ) from exc
 
 
-_DTYPE_SIZE: Dict[DType, int] = {
+_DTYPE_SIZE: Dict[DType, float] = {
     DType.FP32: 4,
     DType.FP16: 2,
     DType.BF16: 2,
     DType.FP8: 1,
+    DType.MXFP8: 1,
+    DType.HIF8: 1,
+    DType.MXFP4: 0.5,
     DType.INT32: 4,
     DType.INT16: 2,
     DType.INT8: 1,
@@ -124,6 +132,9 @@ _DTYPE_ALIASES: Dict[str, str] = {
     "float16": "fp16", "f16": "fp16", "half": "fp16",
     "bfloat16": "bf16",
     "float8": "fp8", "f8": "fp8", "e4m3": "fp8", "e5m2": "fp8",
+    "microscalingfp8": "mxfp8", "mx8": "mxfp8",
+    "huaweifp8": "hif8", "hi8": "hif8",
+    "microscalingfp4": "mxfp4", "mx4": "mxfp4",
     "i32": "int32", "s32": "int32",
     "i16": "int16", "s16": "int16",
     "i8": "int8", "s8": "int8",
@@ -723,11 +734,58 @@ def _ascend351x() -> NpuArchitecture:
     )
 
 
+def _ascend950pr() -> NpuArchitecture:
+    """Default 32 Cube / 64 Vector 950PR bin from the 2026 whitepaper."""
+    pools = _standard_pools(l1_bytes=512 * KiB, ub_bytes=512 * KiB,
+                            l0c_bytes=256 * KiB)
+    pools["GM"] = replace(
+        pools["GM"], capacity_bytes=128 * 1024 * MiB,
+        description="Package-attached high-speed memory in a two-AI-Die UMA space.",
+    )
+    cube = _cube_unit(base_macs_per_cycle=4096, fp8=True)
+    profiles = dict(cube.dtype_profiles)
+    for dtype, k0, macs in (
+        (DType.MXFP8, 32, 8192), (DType.HIF8, 32, 8192),
+        (DType.MXFP4, 64, 16384),
+    ):
+        profiles[dtype.value] = CubeDTypeProfile(dtype, k0=k0,
+                                                 macs_per_cycle=macs)
+    return NpuArchitecture(
+        name="ascend950pr", family="DaVinci v3 (Ascend 950PR)",
+        # Approximation inferred from 432 TFLOP/s Cube FP16 / 32 cores.
+        frequency_ghz=1.65, cube_cores=32, vector_cores=64,
+        pools=pools,
+        pipes=_standard_pipes(mte2_bpc=128.0, mte1_bpc=128.0,
+                              fixpipe_bpc=128.0, mte3_bpc=128.0),
+        cube=replace(cube, dtype_profiles=profiles),
+        vector=_vector_unit(bytes_per_cycle=512.0),
+        hbm_bandwidth_gbps=1600.0, l2_capacity_bytes=128 * MiB,
+        notes="950PR default bin; 28/56, 112 GB and 112 MB L2 variants also exist. "
+              "Frequency and local DMA rates are analytical estimates.",
+    )
+
+
+def _ascend950dt() -> NpuArchitecture:
+    """Default full 36 Cube / 72 Vector 950DT bin."""
+    pr = _ascend950pr()
+    return pr.evolve(
+        name="ascend950dt", family="DaVinci v3 (Ascend 950DT)",
+        cube_cores=36, vector_cores=72,
+        pools={**pr.pools, "GM": replace(pr.pool("GM"),
+                                         capacity_bytes=144 * 1024 * MiB)},
+        hbm_bandwidth_gbps=4000.0,
+        notes="950DT default bin; 32/64 and 28/56 variants also exist. "
+              "Frequency and local DMA rates are analytical estimates.",
+    )
+
+
 _REGISTRY: Dict[str, Callable[[], NpuArchitecture]] = {
     "ascend310p": _ascend310p,
     "ascend910b": _ascend910b,
     "ascend910c": _ascend910c,
     "ascend351x": _ascend351x,
+    "ascend950pr": _ascend950pr,
+    "ascend950dt": _ascend950dt,
 }
 
 _ALIASES: Dict[str, str] = {
@@ -738,6 +796,9 @@ _ALIASES: Dict[str, str] = {
     "ascend910b4": "ascend910b",
     "910c": "ascend910c",
     "351x": "ascend351x",
+    "950pr": "ascend950pr",
+    "950dt": "ascend950dt",
+    "ascend950": "ascend950dt",
     "default": "ascend910b",
 }
 

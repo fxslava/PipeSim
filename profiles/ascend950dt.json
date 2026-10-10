@@ -1,0 +1,214 @@
+{
+  "schema_version": 1,
+  "soc_name": "ascend950dt",
+  "display_name": "Ascend 950DT (DaVinci v3)",
+  "isa_generation": "davinci_v3",
+  "aliases": [
+    "950dt",
+    "ascend950"
+  ],
+  "provisional": false,
+  "notes": "Default bin from the 2026 Ascend 950 NPU architecture whitepaper. Local MTE/NDDMA/CV bandwidths, latencies, core frequency, and per-cycle dtype rates, local alignments, and sync penalty are analytical modeling assumptions inferred from the published relative/aggregate throughput, not whitepaper instruction timing specifications. UB is 512 KiB per AI subsystem across two 256 KiB Vector cores, not 512 KiB independently per Vector core.",
+  "system": {
+    "ai_cores": 36,
+    "cube_cores": 36,
+    "vector_cores": 72,
+    "core_freq_mhz": 1650,
+    "l2_cache_bytes": 134217728,
+    "hbm_bandwidth_gbps": 4000.0,
+    "decoupled_vector_core": true
+  },
+  "access_block_bytes": 32,
+  "memory_domains": {
+    "GM": {
+      "size_bytes": 154618822656,
+      "alignment_bytes": 512,
+      "ports": 2,
+      "description": "Package on-chip high-speed memory, UMA across AI dies; capacity shown as binary GiB approximation."
+    },
+    "L1": {
+      "size_bytes": 524288,
+      "alignment_bytes": 32,
+      "size_alignment_bytes": 32,
+      "stride_alignment_bytes": 32,
+      "ports": 2,
+      "description": "Cube-local scratchpad staging GM tiles before MTE1."
+    },
+    "L0A": {
+      "size_bytes": 65536,
+      "alignment_bytes": 512,
+      "size_alignment_bytes": 512,
+      "stride_alignment_bytes": 32,
+      "description": "Cube left-matrix operand buffer, Zz fractal layout; allocations are whole 16x16 fp16 fractals (512 B)."
+    },
+    "L0B": {
+      "size_bytes": 65536,
+      "alignment_bytes": 512,
+      "size_alignment_bytes": 512,
+      "stride_alignment_bytes": 32,
+      "description": "Cube right-matrix operand buffer, Nz fractal layout; allocations are whole 16x16 fp16 fractals (512 B)."
+    },
+    "L0C": {
+      "size_bytes": 262144,
+      "alignment_bytes": 1024,
+      "size_alignment_bytes": 1024,
+      "stride_alignment_bytes": 32,
+      "description": "FP32/INT32 accumulator; 4 B per element, allocations are whole 16x16 fp32 fractals (1024 B)."
+    },
+    "UB": {
+      "size_bytes": 524288,
+      "alignment_bytes": 32,
+      "size_alignment_bytes": 32,
+      "stride_alignment_bytes": 32,
+      "banks": 8,
+      "bank_stride_bytes": 32,
+      "ports": 2,
+      "description": "Aggregate 512 KiB per AI subsystem: UB0/UB1 256 KiB per Vector core; 8-way 32 B bank interleave."
+    }
+  },
+  "transfer_channels": {
+    "MTE2": {
+      "src": "GM",
+      "dst": "L1",
+      "bandwidth_bytes_per_cycle": 128.0,
+      "base_latency_cycles": 200.0,
+      "min_burst_bytes": 512,
+      "max_outstanding": 8,
+      "description": "GM -> L1 load, optional ND->NZ reformat."
+    },
+    "MTE2_UB": {
+      "src": "GM",
+      "dst": "UB",
+      "bandwidth_bytes_per_cycle": 128.0,
+      "base_latency_cycles": 200.0,
+      "min_burst_bytes": 512,
+      "max_outstanding": 8,
+      "description": "GM -> UB load for Vector-side operands."
+    },
+    "MTE1": {
+      "src": "L1",
+      "dst": "L0A",
+      "bandwidth_bytes_per_cycle": 128.0,
+      "base_latency_cycles": 20.0,
+      "min_burst_bytes": 32,
+      "max_outstanding": 4,
+      "description": "L1 -> L0A/L0B fractal load (LoadData2d/3d)."
+    },
+    "FIXPIPE": {
+      "src": "L0C",
+      "dst": "GM",
+      "bandwidth_bytes_per_cycle": 128.0,
+      "base_latency_cycles": 80.0,
+      "min_burst_bytes": 32,
+      "max_outstanding": 4,
+      "description": "L0C -> GM/UB drain with inline quant/dequant/ReLU."
+    },
+    "MTE3": {
+      "src": "UB",
+      "dst": "GM",
+      "bandwidth_bytes_per_cycle": 128.0,
+      "base_latency_cycles": 150.0,
+      "min_burst_bytes": 512,
+      "max_outstanding": 4,
+      "description": "UB -> GM store."
+    },
+    "NDDMA": {
+      "src": "GM",
+      "dst": "UB",
+      "bandwidth_bytes_per_cycle": 128.0,
+      "base_latency_cycles": 160.0,
+      "min_burst_bytes": 128,
+      "max_outstanding": 8,
+      "description": "Up to 5D GM-to-UB reorder/transpose with 128 B read coalescing; service rate is a model assumption."
+    },
+    "CV_BYPASS": {
+      "src": "L1",
+      "dst": "UB",
+      "bandwidth_bytes_per_cycle": 128.0,
+      "base_latency_cycles": 20.0,
+      "min_burst_bytes": 32,
+      "max_outstanding": 4,
+      "description": "Direct Cube L1-to-Vector UB path, bypassing L2; rate is a model assumption."
+    }
+  },
+  "compute_engines": {
+    "cube": {
+      "fractal_shape": {
+        "m0": 16,
+        "n0": 16,
+        "k0": 16
+      },
+      "pipeline_latency_cycles": 16.0,
+      "issue_overhead_cycles": 1.0,
+      "read_bytes_per_cycle": 1024,
+      "dtype_profiles": {
+        "fp16": {
+          "k0": 16,
+          "macs_per_cycle": 4096,
+          "accumulator": "fp32"
+        },
+        "bf16": {
+          "k0": 16,
+          "macs_per_cycle": 4096,
+          "accumulator": "fp32"
+        },
+        "int8": {
+          "k0": 32,
+          "macs_per_cycle": 8192,
+          "accumulator": "int32"
+        },
+        "uint8": {
+          "k0": 32,
+          "macs_per_cycle": 8192,
+          "accumulator": "int32"
+        },
+        "fp32": {
+          "k0": 8,
+          "macs_per_cycle": 1024,
+          "accumulator": "fp32"
+        },
+        "mxfp8": {
+          "k0": 32,
+          "macs_per_cycle": 8192,
+          "accumulator": "fp32"
+        },
+        "hif8": {
+          "k0": 32,
+          "macs_per_cycle": 8192,
+          "accumulator": "fp32"
+        },
+        "mxfp4": {
+          "k0": 64,
+          "macs_per_cycle": 16384,
+          "accumulator": "fp32"
+        },
+        "tf32": {
+          "k0": 8,
+          "macs_per_cycle": 2048,
+          "accumulator": "fp32"
+        }
+      }
+    },
+    "vector": {
+      "bytes_per_cycle": 512.0,
+      "register_bytes": 256,
+      "pipeline_latency_cycles": 8.0,
+      "issue_overhead_cycles": 4.0
+    },
+    "scalar": {
+      "pipeline_latency_cycles": 4.0
+    }
+  },
+  "synchronization": {
+    "sync_handoff_cycles": 30
+  },
+  "features": [
+    "mxfp4_cube",
+    "mxfp8_cube",
+    "hif8_cube",
+    "nddma",
+    "cv_bypass",
+    "bufferid_sync",
+    "simd_simt_vf"
+  ]
+}

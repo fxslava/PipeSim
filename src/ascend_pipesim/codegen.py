@@ -188,6 +188,7 @@ class _Ctx:
     transpose_a: bool
     transpose_b: bool
     epilogue: List[str]
+    ub_footprint_bytes: int
 
 
 def _footprint_bytes(
@@ -344,6 +345,8 @@ def _build_ctx(
         transpose_a=flow.transpose_a,
         transpose_b=flow.transpose_b,
         epilogue=[op.kind for op in flow.epilogue],
+        ub_footprint_bytes=(report.sram_footprints["UB"].bytes_used
+                            if "UB" in report.sram_footprints else 0),
     )
 
 
@@ -484,6 +487,12 @@ def _emit_tiling_header(c: _Ctx) -> str:
         f"static_assert(CO1_BUFFER_BYTES * {q['queCO1_'].depth} <= "
         f"{q['queCO1_'].capacity_bytes}, \"L0C overflow\");"
     )
+    if c.ub_footprint_bytes:
+        L.append(f"constexpr uint32_t UB_EPILOGUE_BYTES = {c.ub_footprint_bytes};")
+        L.append(
+            f"static_assert(UB_EPILOGUE_BYTES <= {c.arch.pool('UB').capacity_bytes}, "
+            '"UB overflow");'
+        )
     L.append("")
     L.append("// --- host-side tiling record (one instance per launch) -------------------")
     L.append("struct PipeSimTiling {")
@@ -549,7 +558,7 @@ def _nd2nz_block(c: _Ctx, operand: str) -> List[str]:
     ]
 
 
-def _emit_kernel_cpp(c: _Ctx) -> str:
+def _emit_kernel_cpp(c: _Ctx, bufferid_sync: bool = False) -> str:
     q = c.buffers
     L: List[str] = []
     L.append("// kernel.cpp")
@@ -867,7 +876,14 @@ def _emit_kernel_cpp(c: _Ctx) -> str:
         "        // the Cube reuses L0C.  EVENT_ID0 is a literal so the"
     )
     L.append("        // handshake stays statically resolvable.")
+    if bufferid_sync:
+        L.append("#if defined(PIPESIM_USE_BUFFERID)")
+        L.append("        // DaVinci v3 BufferID API spelling is SDK dependent; bind these pipe IDs for your CANN release.")
+        L.append("        get_buf(PIPE_M, 0);")
+        L.append("#else")
     L.append("        SetFlag<HardEvent::M_FIX>(EVENT_ID0);")
+    if bufferid_sync:
+        L.append("#endif")
     L.append("        LocalTensor<C_T> co1 = queCO1_.AllocTensor<C_T>();")
     L.append("        auto cOut = matmulObj.GetTensorC();")
     L.append("        DataCopyParams fixpipeCopy;")
@@ -879,7 +895,13 @@ def _emit_kernel_cpp(c: _Ctx) -> str:
     )
     L.append("        DataCopy(cGM_[mo * TILE_M * N_EXTENT + no * TILE_N], cOut, fixpipeCopy);")
     L.append("        queCO1_.FreeTensor(co1);")
+    if bufferid_sync:
+        L.append("#if defined(PIPESIM_USE_BUFFERID)")
+        L.append("        rel_buf(PIPE_M, 0);")
+        L.append("#else")
     L.append("        WaitFlag<HardEvent::M_FIX>(EVENT_ID0);")
+    if bufferid_sync:
+        L.append("#endif")
     L.append("    }")
     L.append("")
     L.append("    // zZ (A) layout: each k0-fractal column block holds TILE_M_PAD rows")
@@ -978,6 +1000,8 @@ def synthesize_kernel(
     report: EvaluationReport,
     flow: AlgorithmFlow,
     arch: "str | NpuArchitecture | None" = None,
+    *,
+    bufferid_sync: bool = False,
 ) -> KernelBundle:
     """Convert an evaluation result and its tiling into Ascend C sources.
 
@@ -987,6 +1011,8 @@ def synthesize_kernel(
     natural calling pattern is ``synthesize_kernel(evaluate(flow), flow)``.
     """
     arch = get_architecture(arch if arch is not None else report.arch_name)
+    if bufferid_sync and not arch.family.startswith("DaVinci v3"):
+        raise ValueError("BufferID synchronization requires a DaVinci v3 target")
     c = _build_ctx(report, flow, arch)
     meta = {
         "kernel_name": c.kernel_name,
@@ -1008,10 +1034,11 @@ def synthesize_kernel(
         "tail_sizes": {"m": c.tail_m, "n": c.tail_n, "k": c.tail_k},
         "transposes": {"a": c.transpose_a, "b": c.transpose_b},
         "epilogue": c.epilogue,
+        "bufferid_sync": bufferid_sync,
         "predicted": c.predicted,
     }
     return KernelBundle(
-        kernel_cpp=_emit_kernel_cpp(c),
+        kernel_cpp=_emit_kernel_cpp(c, bufferid_sync=bufferid_sync),
         kernel_tiling_h=_emit_tiling_header(c),
         buffers=c.buffers,
         meta=meta,
@@ -1022,9 +1049,11 @@ def synthesize(
     flow: AlgorithmFlow,
     arch: "str | NpuArchitecture" = "ascend910b",
     options: Any = None,
+    *,
+    bufferid_sync: bool = False,
 ) -> KernelBundle:
     """Evaluate ``flow`` and synthesise its kernel in one step."""
     from .evaluator import evaluate as _evaluate
 
     report = _evaluate(flow, arch, options)
-    return synthesize_kernel(report, flow, arch)
+    return synthesize_kernel(report, flow, arch, bufferid_sync=bufferid_sync)
