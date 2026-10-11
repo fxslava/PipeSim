@@ -1,5 +1,7 @@
 # Parametric frontier exploration
 
+> **Back to the project overview:** [PipeSim README](../README.md)
+
 The frontier engine searches `AlgorithmFlow` objects. It emits typed flows in
 JSON and does not generate kernel source. It reuses the three-tier evaluator for
 SRAM feasibility, hierarchical rooflines, and the max-plus schedule.
@@ -25,6 +27,13 @@ for candidate in result.candidates:
 ```
 
 To use JSON, write `flow.to_dict()` to a file and run:
+
+```text
+npu-pipesim frontier --flow-file flow.json --arch ascend950pr \
+  --uncertainty uncertainty.json --topk 5 --output frontier.json
+```
+
+The same unified command is available as a Python module:
 
 ```text
 python -m ascend_pipesim frontier --flow-file flow.json --arch ascend950pr \
@@ -75,3 +84,7 @@ The long-lived JSON-RPC server accepts the same search through `method:
 "frontier"`. Pass an `AlgorithmFlow.to_dict()` object in `params.flow`, an
 uncertainty interval object in `params.uncertainty`, and search controls such
 as `topk` and `max_evaluations` in `params`.
+
+---
+
+**Project overview:** [README.md](../README.md)

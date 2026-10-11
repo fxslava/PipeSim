@@ -1,11 +1,14 @@
 # Unified SoC Architecture Meta-Language & Dynamic Manifest Registration
 
-**Status:** design accepted, Phase A assets delivered (`profiles/`).
+> **Note on Implementation Status:** This document is an architectural design proposal for cross-tool manifest unification with `ascend-kernel-analyzer`. Built-in PipeSim hardware topologies currently reside in `topology.py`.
+
+**Status:** Proposal; the shared-manifest design described below is not the
+source of PipeSim's currently active built-in topologies.
 **Scope:** `D:\Projects\PipeSim` (analytical simulator / auto-tiler) and
 `D:\Projects\ascend-kernel-analyzer` (static AST / deadlock / memory auditor).
-**Goal:** adding a chip target (a commercial binning like `ascend950pr`, a custom
-910B SKU, an edge variant) becomes "drop one JSON file into a shared `profiles/`
-directory" — zero Python/C++ source changes in either tool.
+**Goal:** adding a chip target (a commercial binning, a custom 910B SKU, or an
+edge variant) becomes "drop one JSON file into a shared `profiles/` directory"
+— zero Python/C++ source changes in either tool.
 
 ---
 
@@ -64,14 +67,18 @@ per-feature gating; UB partitioning quadruple; provisional-capacity flags.
 | D5 | **UB bank count** | data field on the pool | hardcoded `banks = 8` in AKA3006 | Manifest field `memory_domains.UB.banks`; Phase C removes the hardcode. |
 | D6 | **310P coverage** | present | absent | 310P manifest exists (UB explicitly 192 KiB per ground truth); analyzer simply has no entry until someone adds `isa_generation: davinci_v15` audit rules — acceptable, the loader degrades to "unknown chip" explicitly. Audit-layer fields the analyzer would need (event-id reservations) are omitted rather than invented. |
 | D7 | **Aliases** | `910b`, `default`, … | `910b`, `atlas-a2`, … | Union in the manifest; each tool's resolver reads the same list. |
+| D8 | **950PR topology** | Built-in `ascend950pr` DaVinci v3 (`arch35`) profile in `topology.py`: 1.65 GHz, 32 Cube / 64 Vector cores, 216 KiB tensor UB budget, 32 KiB SIMT DataCache, and MXFP4/MXFP8 profiles. | Not evaluated here | This implemented PipeSim profile is not a legacy 20-core 910B binning. Any equivalent shared-manifest representation remains part of this proposal. |
 
 ---
 
 ## 2. The meta-language
 
-Normative contract: `profiles/ascend_soc_profile.schema.json` (JSON Schema
-draft-07, self-contained). Examples: `profiles/ascend910b.json` (full profile)
-and `profiles/ascend950pr.json` (commercial binning). Design decisions:
+Proposed normative contract: `profiles/ascend_soc_profile.schema.json` (JSON
+Schema draft-07, self-contained). The profile paths and inheritance rules in
+this section describe the proposed cross-tool design; PipeSim's current
+built-in profiles are implemented in `src/ascend_pipesim/topology.py`.
+Examples considered by the proposal include an `ascend910b` profile and an
+`ascend950pr` profile. Design decisions:
 
 * **Tool-neutral union.** The schema is the superset; each consumer validates
   and reads its subset and ignores the rest (`additionalProperties` at the
@@ -81,13 +88,15 @@ and `profiles/ascend950pr.json` (commercial binning). Design decisions:
   layer (latencies, bursts, per-dtype rates), audit layer (alignments ×3,
   event IDs, features, UB partitioning). Layers live beside each other in one
   file because they describe one die.
-* **Commercial labels are derivations, not chips.** `base_profile` +
+* **Commercial labels are derivations, not chips.** In the proposed manifest
+  model, `base_profile` +
   `commercial_label: true` inherits everything (deep merge: objects per-key,
   arrays/scalars replace) and may only override `system` binning metadata and
   identity fields. A commercial profile that edits pools/channels/dtype
-  throughputs fails validation. This is how `ascend950pr` exists without
-  inventing silicon: 20-core binning of 910B, everything else inherited,
-  HBM explicitly *not* re-calibrated.
+  throughputs fails validation. This is a general design rule for future
+  manifest derivations; it does not describe the active `ascend950pr`
+  implementation, which is the DaVinci v3 (`arch35`) profile recorded in
+  §1.5.
 * **Versioned.** `schema_version: 1`; loaders reject unknown major versions.
 
 Minimal custom chip example (all defaults inherited from `davinci_v2`):
@@ -157,9 +166,9 @@ Resolution order for the profiles directory:
   golden-test-identical or explicitly versioned newer.
 * The CLI's `--arch-file` / `--pipe-bw` / … overrides keep working unchanged
   on top of any profile-built architecture.
-* 950PR falls out for free: `--arch ascend950pr` resolves the alias chain to a
-  910B-identical `NpuArchitecture` with `cores`-independent behaviour (PipeSim
-  is per-core; the binning count is metadata).
+* The proposal would map a profile to `NpuArchitecture`. It does not change the
+  active built-in `ascend950pr` topology described in §1.5; in particular,
+  that topology is not 910B-identical.
 
 ### 3.3 ascend_analyzer consumption (`hardware.py`, CLI, checkers)
 
@@ -186,10 +195,10 @@ Resolution order for the profiles directory:
 
 ## 4. Phased migration plan
 
-**Phase A — schema & shared assets (done in this change set).**
-Deliver `profiles/ascend_soc_profile.schema.json`, `profiles/ascend910b.json`,
-`profiles/ascend950pr.json`, this document. Add remaining manifests
-(`ascend310p`, `ascend910c`, `ascend351x`) plus a cross-tool
+**Phase A — schema & shared assets (proposal; implementation pending).**
+The proposed deliverables are `profiles/ascend_soc_profile.schema.json`,
+`profiles/ascend910b.json`, `profiles/ascend950pr.json`, and this document.
+Add remaining manifests (`ascend310p`, `ascend910c`, `ascend351x`) plus a cross-tool
 `scripts/check_profiles.py` that asserts manifest→objects equivalence against
 each tool's built-ins (surfacing D2/D3 as explicit failures until decided).
 *Gate:* schema validates all manifests; equivalence green for 910B.
@@ -198,8 +207,8 @@ each tool's built-ins (surfacing D2/D3 as explicit failures until decided).
 Add `ascend_soc_manifest.py` + `architecture_from_profile` +
 registry wiring behind the resolution order in §3.1; keep built-ins as
 fallback; new tests: manifest-built 910B probe JSON ≡ built-in probe JSON
-(golden), `--arch ascend950pr` works and equals 910B per-core, unknown-chip
-error lists manifest names.
+(golden), the active DaVinci v3 `ascend950pr` topology remains distinct from
+910B, and unknown-chip errors list manifest names.
 *Gate:* all 27 existing tests pass unmodified + new profile tests.
 
 **Phase C — analyzer integration.**
@@ -210,12 +219,20 @@ built-in fallback module). Analyzer's own `tests/` suite must pass.
 *Gate:* zero hardcoded chip lists outside the built-in fallback; analyzer
 regression suite green.
 
+---
+
 **Phase D — validation gate (the acceptance demo).**
 Write a dummy `test_chip_custom.json` (910B-derived, 8 cores, odd UB size)
 into a temp dir; `ASCEND_CHIP_PROFILES_DIR=<tmp>`; then
 `npu-pipesim probe --arch test_chip_custom --gemm 512,512,512` and
 `python -m ascend_analyzer kernel.cpp --chip test_chip_custom` must both run
-with **no source changes and no rebuild**; `--arch ascend950pr` maps to
-910B-identical behaviour in both tools; deleting the profiles dir restores
-built-in behaviour. Each phase ends with both suites green; nothing is
-removed, only superseded, until its replacement is proven equivalent.
+with **no source changes and no rebuild**. Profile loading must preserve each
+tool's current built-ins, including PipeSim's DaVinci v3 `ascend950pr`;
+deleting the profiles dir restores built-in behaviour. Each phase ends with
+both suites green; nothing is removed, only superseded, until its replacement
+is proven equivalent.
+
+---
+
+**PipeSim project overview:** [README.md](../README.md)
+· [Frontier exploration](FRONTIER_EXPLORATION.md)

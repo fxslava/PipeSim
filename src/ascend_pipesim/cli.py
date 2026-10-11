@@ -953,7 +953,7 @@ def build_parser() -> argparse.ArgumentParser:
     frontier.add_argument(
         "--uncertainty", metavar="PATH", help="JSON uncertainty interval box"
     )
-    frontier.add_argument("--topk", type=int, default=5)
+    frontier.add_argument("--topk", "--top-k", dest="topk", type=int, default=5)
     frontier.add_argument("--max-evaluations", type=int, default=240)
     frontier.add_argument("--max-tile", type=int, default=256)
     frontier.add_argument("--forbid-tails", action="store_true")
