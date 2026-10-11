@@ -51,6 +51,8 @@ __all__ = [
     "BufferPlan",
     "EpilogueOp",
     "SimtWorkload",
+    "ExecutionMode",
+    "ExecutionGraph",
     "AlgorithmFlow",
     "FlowValidationError",
 ]
@@ -138,6 +140,48 @@ class OpType(str, Enum):
 
     VECTOR_GEMV = "vector_gemv"
     """Vector-core GEMV: weight rows and one input vector, reduced in UB."""
+
+
+class ExecutionMode(str, Enum):
+    STANDALONE_CUBE = "standalone_cube"
+    MIX_SPLIT_M = "mix_split_m"
+    MIX_SPLIT_N = "mix_split_n"
+    HYBRID_SIMT_SIMD = "hybrid_simt_simd"
+
+
+@dataclass(frozen=True)
+class ExecutionGraph:
+    """Lowered graph topology; ring slots are producer/consumer credits."""
+
+    mode: ExecutionMode = ExecutionMode.STANDALONE_CUBE
+    ring_slots: int = 1
+    ring_space: str = "UB"
+    vector_consumers: int = 1
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "mode", ExecutionMode(self.mode))
+        object.__setattr__(self, "ring_space", self.ring_space.upper())
+        if self.ring_slots < 1 or self.vector_consumers < 1:
+            raise FlowValidationError(
+                "ring_slots and vector_consumers must be positive"
+            )
+        if self.ring_space not in ("UB", "GM"):
+            raise FlowValidationError("ring_space must be UB or GM")
+        if self.mode in (ExecutionMode.MIX_SPLIT_M, ExecutionMode.MIX_SPLIT_N):
+            if self.vector_consumers != 2:
+                raise FlowValidationError("MIX mode requires two Vector consumers")
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "mode": self.mode.value,
+            "ring_slots": self.ring_slots,
+            "ring_space": self.ring_space,
+            "vector_consumers": self.vector_consumers,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "ExecutionGraph":
+        return cls(**data)
 
 
 class Layout(str, Enum):
@@ -583,6 +627,7 @@ class AlgorithmFlow:
     cores: int = 1
     notes: str = ""
     simt: SimtWorkload | None = None
+    execution_graph: ExecutionGraph = field(default_factory=ExecutionGraph)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "op_type", OpType(self.op_type))
@@ -591,6 +636,20 @@ class AlgorithmFlow:
         object.__setattr__(self, "output_path", OutputPath(self.output_path))
         object.__setattr__(self, "epilogue", tuple(self.epilogue))
         object.__setattr__(self, "tile", self.tile.bind(self.loops))
+        if (
+            self.execution_graph.mode is ExecutionMode.HYBRID_SIMT_SIMD
+            and self.simt is None
+        ):
+            raise FlowValidationError("hybrid_simt_simd requires a SIMT workload")
+        if self.execution_graph.mode in (
+            ExecutionMode.MIX_SPLIT_M,
+            ExecutionMode.MIX_SPLIT_N,
+        ):
+            if self.op_type in (OpType.ELEMWISE, OpType.VECTOR_GEMV):
+                raise FlowValidationError("MIX split modes require a Cube operator")
+        if self.execution_graph.mode is ExecutionMode.HYBRID_SIMT_SIMD:
+            if self.op_type is not OpType.VECTOR_GEMV:
+                raise FlowValidationError("hybrid_simt_simd requires vector_gemv")
         if self.cores < 1:
             raise FlowValidationError(f"cores={self.cores} must be >= 1")
         if self.op_type not in (OpType.ELEMWISE, OpType.VECTOR_GEMV):
@@ -893,6 +952,7 @@ class AlgorithmFlow:
             "cores": self.cores,
             "notes": self.notes,
             "simt": self.simt.to_dict() if self.simt else None,
+            "execution_graph": self.execution_graph.to_dict(),
         }
 
     @classmethod
@@ -915,6 +975,7 @@ class AlgorithmFlow:
             cores=int(data.get("cores", 1)),
             notes=data.get("notes", ""),
             simt=SimtWorkload.from_dict(data["simt"]) if data.get("simt") else None,
+            execution_graph=ExecutionGraph.from_dict(data.get("execution_graph", {})),
         )
 
     def describe(self) -> str:

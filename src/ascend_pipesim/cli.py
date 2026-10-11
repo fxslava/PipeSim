@@ -46,6 +46,11 @@ from .dsl import (
     TensorSpec,
 )
 from .evaluator import EvalOptions, EvaluationReport, evaluate
+from .frontier_search import (
+    FrontierResult,
+    FrontierSearchOptions,
+    find_optimal_frontiers,
+)
 from .topology import (
     DType,
     NpuArchitecture,
@@ -53,6 +58,7 @@ from .topology import (
     get_architecture,
     list_architectures,
 )
+from .uncertainty import UncertaintySpace
 
 __all__ = [
     "main",
@@ -60,6 +66,7 @@ __all__ = [
     "run_probe",
     "run_autotile",
     "run_codegen",
+    "run_frontier",
     "serve_rpc",
 ]
 
@@ -387,6 +394,42 @@ def run_autotile(args: argparse.Namespace) -> tuple[int, str]:
     return code, payload
 
 
+def _uncertainty_from_arg(value: Any) -> UncertaintySpace:
+    if value is None:
+        return UncertaintySpace()
+    if isinstance(value, UncertaintySpace):
+        return value
+    if isinstance(value, Mapping):
+        return UncertaintySpace.from_dict(value)
+    with open(value, encoding="utf-8") as handle:
+        return UncertaintySpace.from_dict(json.load(handle))
+
+
+def _frontier_result(
+    args: argparse.Namespace, flow: AlgorithmFlow | None = None
+) -> FrontierResult:
+    arch = _resolve_architecture(args)
+    template = flow if flow is not None else _build_flow(args)
+    options = FrontierSearchOptions(
+        top_k=args.topk,
+        max_evaluations=args.max_evaluations,
+        max_tile=args.max_tile,
+        forbid_tails=args.forbid_tails,
+        dominance_policy=args.dominance_policy,
+    )
+    return find_optimal_frontiers(
+        template, arch, _uncertainty_from_arg(args.uncertainty), options
+    )
+
+
+def run_frontier(args: argparse.Namespace) -> tuple[int, str]:
+    """Search execution graphs and tiles under a bounded uncertainty space."""
+    result = _frontier_result(args)
+    payload = _json_payload(args, result.to_dict())
+    code = EXIT_INFEASIBLE if args.strict and not result.candidates else EXIT_OK
+    return code, payload
+
+
 def run_codegen(args: argparse.Namespace) -> tuple[int, str]:
     """Evaluate a tiling and synthesise Ascend C kernel sources for it."""
     arch = _resolve_architecture(args)
@@ -535,6 +578,9 @@ def _rpc_namespace(params: Mapping[str, Any]) -> argparse.Namespace:
         "buffer_plans": None,
         "time_budget": None,
         "full_report": False,
+        "flow_file": None,
+        "uncertainty": None,
+        "dominance_policy": "scenario",
     }
     defaults.update(params)
     for key in ("gemm", "tile", "subtile"):
@@ -580,6 +626,19 @@ def _rpc_dispatch(method: str, params: Mapping[str, Any]) -> Any:
         return autotile(_build_flow(args), arch, options).to_dict(
             full_report=args.full_report
         )
+    if method == "frontier":
+        if "topk" not in params:
+            args.topk = 5
+        if "max_evaluations" not in params:
+            args.max_evaluations = 240
+        if "max_tile" not in params:
+            args.max_tile = 256
+        args.uncertainty = params.get("uncertainty", params.get("uncertainty_space"))
+        flow_data = params.get("flow", params.get("flow_template"))
+        flow = AlgorithmFlow.from_dict(flow_data) if flow_data is not None else None
+        if flow is None and args.flow_file and "gemm" not in params:
+            args.gemm = None
+        return _frontier_result(args, flow).to_dict()
     if method == "codegen":
         arch = _resolve_architecture(args)
         flow = _build_flow(args)
@@ -594,7 +653,7 @@ def _rpc_dispatch(method: str, params: Mapping[str, Any]) -> Any:
         flow = AlgorithmFlow.from_dict(params["flow"])
         return evaluate(flow, arch, _eval_options(args)).to_dict()
     raise ValueError(
-        f"unknown method {method!r}; expected one of probe, autotile, "
+        f"unknown method {method!r}; expected one of probe, autotile, frontier, "
         f"codegen, architectures, describe_arch, evaluate_flow"
     )
 
@@ -796,6 +855,8 @@ def build_parser() -> argparse.ArgumentParser:
             "--stationary m\n"
             "  npu-pipesim autotile --arch ascend910b --gemm 4096,4096,8192 "
             "--dtype fp16 --topk 3\n"
+            "  npu-pipesim frontier --arch ascend950pr --flow-file flow.json "
+            "--uncertainty uncertainty.json --topk 5\n"
             "  npu-pipesim codegen --arch ascend910b --gemm 1000,512,1024 "
             "--tile 128,128,64 --outdir generated/\n"
             "  npu-pipesim archs --format text\n"
@@ -879,6 +940,32 @@ def build_parser() -> argparse.ArgumentParser:
     _add_arch_arguments(auto)
     _add_output_arguments(auto)
     auto.set_defaults(func=run_autotile)
+
+    frontier = sub.add_parser(
+        "frontier", help="search graph and tile strategies across uncertainty scenarios"
+    )
+    _add_problem_arguments(frontier, require_gemm=False)
+    frontier.add_argument(
+        "--flow-file", metavar="PATH", help="JSON AlgorithmFlow template"
+    )
+    frontier.add_argument("--tile", type=_int_triple, help=argparse.SUPPRESS)
+    frontier.add_argument("--subtile", type=_int_triple, help=argparse.SUPPRESS)
+    frontier.add_argument(
+        "--uncertainty", metavar="PATH", help="JSON uncertainty interval box"
+    )
+    frontier.add_argument("--topk", type=int, default=5)
+    frontier.add_argument("--max-evaluations", type=int, default=240)
+    frontier.add_argument("--max-tile", type=int, default=256)
+    frontier.add_argument("--forbid-tails", action="store_true")
+    frontier.add_argument(
+        "--dominance-policy",
+        choices=("scenario", "certified_interval"),
+        default="scenario",
+    )
+    _add_staging_arguments(frontier)
+    _add_arch_arguments(frontier)
+    _add_output_arguments(frontier)
+    frontier.set_defaults(func=run_frontier)
 
     gen = sub.add_parser(
         "codegen",

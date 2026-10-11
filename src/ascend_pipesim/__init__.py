@@ -8,12 +8,24 @@ from .dsl import (
     AlgorithmFlow,
     BufferPlan,
     EpilogueOp,
+    ExecutionGraph,
+    ExecutionMode,
     LoopNest,
     OpType,
+    OutputPath,
     SimtWorkload,
+    TensorSpec,
     TileConfig,
 )
 from .evaluator import EvaluationReport, EvalOptions, SimtEstimate, evaluate
+from .frontier_search import (
+    FrontierCandidate,
+    FrontierResult,
+    FrontierSearchOptions,
+    find_optimal_frontiers,
+)
+from .parametric_evaluator import BoundedEvaluation, evaluate_parametric
+from .uncertainty import EnvironmentScenario, Interval, UncertaintySpace
 from .topology import (
     DType,
     NpuArchitecture,
@@ -28,10 +40,14 @@ __all__ = [
     "AlgorithmFlow",
     "BufferPlan",
     "EpilogueOp",
+    "ExecutionGraph",
+    "ExecutionMode",
     "LoopNest",
     "OpType",
+    "OutputPath",
     "TileConfig",
     "SimtWorkload",
+    "TensorSpec",
     # topology
     "DType",
     "NpuArchitecture",
@@ -43,6 +59,15 @@ __all__ = [
     "EvalOptions",
     "SimtEstimate",
     "evaluate",
+    "Interval",
+    "EnvironmentScenario",
+    "UncertaintySpace",
+    "BoundedEvaluation",
+    "evaluate_parametric",
+    "FrontierCandidate",
+    "FrontierResult",
+    "FrontierSearchOptions",
+    "find_optimal_frontiers",
     # autotiler
     "AutotileOptions",
     "AutotileResult",

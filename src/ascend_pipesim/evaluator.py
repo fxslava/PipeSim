@@ -41,6 +41,7 @@ from typing import Any, Dict, List, Mapping, Sequence, Tuple
 
 from .dsl import (
     AlgorithmFlow,
+    ExecutionMode,
     KPosition,
     LoopOrder,
     OpType,
@@ -275,7 +276,9 @@ class SimtEstimate:
         }
 
 
-def _estimate_simt(flow: AlgorithmFlow, arch: NpuArchitecture) -> SimtEstimate | None:
+def _estimate_simt(
+    flow: AlgorithmFlow, arch: NpuArchitecture, miss_rate_drift: float = 0.0
+) -> SimtEstimate | None:
     if flow.simt is None:
         return None
     hw = arch.simt
@@ -316,6 +319,7 @@ def _estimate_simt(flow: AlgorithmFlow, arch: NpuArchitecture) -> SimtEstimate |
     misses = min(
         transactions, cold_lines + (transactions - cold_lines) * capacity_fraction
     )
+    misses = min(transactions, max(0.0, misses + transactions * miss_rate_drift))
     hbm_misses = misses * (1.0 - work.l2_hit_rate)
     alu = (
         warps
@@ -547,6 +551,10 @@ class EvalOptions:
     emit_hints: bool = True
     #: Below this utilisation a diagnostic is raised.
     utilization_floor_pct: float = 60.0
+    #: Scenario-specific MIX handoff cost; zero preserves legacy evaluation.
+    cross_core_sync_cycles: float = 0.0
+    #: Absolute shift in SIMT DataCache miss probability, clamped to [0, 1].
+    simt_cache_miss_rate_drift: float = 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -766,19 +774,51 @@ def _tier1_footprints(
     ub = arch.pool("UB")
     ub_breakdown: Dict[str, int] = {}
     ub_bytes = 0
+    effective_depth = plan.ub_depth
     if flow.uses_unified_buffer:
-        out_tile = ub.aligned_size(
-            _pad(t.tile_m, 16) * _pad(t.tile_n, 16) * out_itemsize
-        )
+        graph = flow.execution_graph
+        ub_m, ub_n = t.tile_m, t.tile_n
+        if graph.mode is ExecutionMode.MIX_SPLIT_M:
+            ub_m = _ceil_div(ub_m, graph.vector_consumers)
+        elif graph.mode is ExecutionMode.MIX_SPLIT_N:
+            ub_n = _ceil_div(ub_n, graph.vector_consumers)
+        out_tile = ub.aligned_size(_pad(ub_m, 16) * _pad(ub_n, 16) * out_itemsize)
         ub_breakdown["C_tile"] = out_tile
-        ub_bytes += out_tile * plan.ub_depth
+        ring_depth = (
+            flow.execution_graph.ring_slots
+            if flow.execution_graph.mode
+            in (ExecutionMode.MIX_SPLIT_M, ExecutionMode.MIX_SPLIT_N)
+            and flow.execution_graph.ring_space == "UB"
+            else 1
+        )
+        effective_depth = max(plan.ub_depth, ring_depth)
+        ub_bytes += out_tile * effective_depth
         for op in flow.vector_epilogue_ops():
             if op.operand is not None:
-                operand_bytes = ub.aligned_size(op.operand.nbytes)
+                shape = op.operand.shape
+                if graph.mode in (ExecutionMode.MIX_SPLIT_M, ExecutionMode.MIX_SPLIT_N):
+                    if len(shape) >= 2 and shape[-2:] in (
+                        (flow.loops.m, flow.loops.n),
+                        (t.tile_m, t.tile_n),
+                    ):
+                        local_elements = _pad(ub_m, 16) * _pad(ub_n, 16)
+                    elif shape[-1] in (flow.loops.n, t.tile_n):
+                        local_elements = _pad(ub_n, 16)
+                    elif shape[-1] in (flow.loops.m, t.tile_m):
+                        local_elements = _pad(ub_m, 16)
+                    else:
+                        local_elements = op.operand.num_elements
+                else:
+                    local_elements = op.operand.num_elements
+                operand_bytes = ub.aligned_size(local_elements * op.operand.itemsize)
                 ub_breakdown[op.operand.name] = operand_bytes
                 ub_bytes += operand_bytes
     footprints["UB"] = SramFootprint(
-        "UB", ub_bytes, ub.capacity_bytes, plan.ub_depth, ub_breakdown
+        "UB",
+        ub_bytes,
+        ub.capacity_bytes,
+        effective_depth,
+        ub_breakdown,
     )
 
     # -- capacity violations ---------------------------------------------
@@ -797,6 +837,23 @@ def _tier1_footprints(
                         "capacity_bytes": fp.capacity_bytes,
                         "depth": fp.depth,
                         "breakdown": fp.breakdown,
+                    },
+                )
+            )
+
+    if flow.execution_graph.mode in (
+        ExecutionMode.MIX_SPLIT_M,
+        ExecutionMode.MIX_SPLIT_N,
+    ):
+        if not arch.decoupled_vector_core or arch.vector_cores < 2 * flow.cores:
+            violations.append(
+                Violation(
+                    "MIX_CORE_TOPOLOGY",
+                    Severity.ERROR,
+                    "MIX 1 AIC : 2 AIV requires two available Vector cores per Cube core",
+                    {
+                        "cube_cores_requested": flow.cores,
+                        "vector_cores": arch.vector_cores,
                     },
                 )
             )
@@ -1120,6 +1177,7 @@ _STAGE_TO_BOTTLENECK = {
     "FIXPIPE": "FIXPIPE_BACKPRESSURE",
     "VECTOR": "VECTOR_BOUND",
     "MTE3": "MTE3_BOUND",
+    "IPC": "CROSS_CORE_SYNC_BOUND",
 }
 
 
@@ -1135,6 +1193,7 @@ def _tier3_schedule(
     mte2_bpc: float,
     mte2_derate: float,
     simt: SimtEstimate | None = None,
+    sync_cycles: float = 0.0,
 ) -> PipelineSchedule:
     """Steady-state ``T_iter = max_s tau_s`` with depth-aware serialisation.
 
@@ -1145,6 +1204,28 @@ def _tier3_schedule(
     plan = flow.buffers
     steps = max(1, work.steps)
     cube = arch.cube
+    graph = flow.execution_graph
+    if graph.mode is ExecutionMode.MIX_SPLIT_M:
+        vector_share = _pad(
+            _ceil_div(flow.tile.tile_m, graph.vector_consumers), 16
+        ) / _pad(flow.tile.tile_m, 16)
+    elif graph.mode is ExecutionMode.MIX_SPLIT_N:
+        vector_share = _pad(
+            _ceil_div(flow.tile.tile_n, graph.vector_consumers), 16
+        ) / _pad(flow.tile.tile_n, 16)
+    else:
+        vector_share = 1.0
+    outer_tiles = flow.tile.n_outer_tiles * flow.loops.batch
+    mte2_service = _safe_div(traffic["mte2_bytes"], steps * mte2_bpc * mte2_derate)
+    # Outstanding loads bound sustained issue under DMA latency jitter.
+    # The first load is already charged in fill_cycles.
+    if outer_tiles > plan.l1_depth and plan.l1_depth >= 2:
+        mte2_service = max(
+            mte2_service,
+            arch.pipe("MTE2").base_latency_cycles
+            * outer_tiles
+            / (steps * plan.l1_depth),
+        )
 
     issued_cube_cycles = work.issued_macs / macs_per_cycle
     ideal_cube_cycles = flow.loops.macs / macs_per_cycle
@@ -1152,7 +1233,7 @@ def _tier3_schedule(
     stages: List[PipelineStage] = [
         PipelineStage(
             "MTE2",
-            _safe_div(traffic["mte2_bytes"], steps * mte2_bpc * mte2_derate),
+            mte2_service,
             traffic["mte2_bytes"],
             plan.l1_depth >= 2,
             plan.l1_depth,
@@ -1187,7 +1268,8 @@ def _tier3_schedule(
                 (
                     _safe_div(vector_bytes, steps * arch.vector.bytes_per_cycle)
                     + (simt.vector_alu_cycles / steps if simt else 0.0)
-                ),
+                )
+                * vector_share,
                 vector_bytes,
                 vector_overlapped,
                 plan.ub_depth,
@@ -1197,10 +1279,28 @@ def _tier3_schedule(
         stages.append(
             PipelineStage(
                 "MTE3",
-                _safe_div(mte3_bytes, steps * arch.pipe("MTE3").bandwidth_bpc),
+                _safe_div(mte3_bytes, steps * arch.pipe("MTE3").bandwidth_bpc)
+                * vector_share,
                 mte3_bytes,
                 plan.ub_depth >= 2,
                 plan.ub_depth,
+            )
+        )
+    mix = flow.execution_graph.mode in (
+        ExecutionMode.MIX_SPLIT_M,
+        ExecutionMode.MIX_SPLIT_N,
+    )
+    if mix:
+        outer_tiles = flow.tile.n_outer_tiles * flow.loops.batch
+        # Producer-ready and consumer-credit handoffs per streamed tile.
+        ipc_per_step = 2.0 * sync_cycles * outer_tiles / steps
+        stages.append(
+            PipelineStage(
+                "IPC",
+                ipc_per_step,
+                0.0,
+                flow.execution_graph.ring_slots >= 2,
+                flow.execution_graph.ring_slots,
             )
         )
 
@@ -1245,7 +1345,11 @@ def _tier3_schedule(
     )
     if simt is not None:
         fill += simt.cache_latency_cycles
+    if mix:
+        fill += sync_cycles  # first producer-ready handoff
     drain = arch.pipe("FIXPIPE").base_latency_cycles
+    if mix:
+        drain += sync_cycles  # last consumer-credit return
     if flow.uses_unified_buffer:
         drain += arch.pipe("MTE3").base_latency_cycles
     # Every outer tile pays the GM latency again unless depth hides it.
@@ -1654,7 +1758,7 @@ def _evaluate_elemwise(
     tile_elems = flow.tile.tile_m
     steps = _ceil_div(elements, tile_elems)
     plan = flow.buffers
-    simt = _estimate_simt(flow, arch)
+    simt = _estimate_simt(flow, arch, options.simt_cache_miss_rate_drift)
 
     footprints, violations = _tier1_footprints_elemwise(
         flow, arch, itemsize, out_itemsize
@@ -1857,7 +1961,7 @@ def evaluate(
     """
     arch = get_architecture(arch)
     options = options or EvalOptions()
-    simt = _estimate_simt(flow, arch)
+    simt = _estimate_simt(flow, arch, options.simt_cache_miss_rate_drift)
 
     if flow.op_type in (OpType.ELEMWISE, OpType.VECTOR_GEMV):
         return _evaluate_elemwise(flow, arch, options)
@@ -1883,6 +1987,19 @@ def evaluate(
 
     # -- traffic -----------------------------------------------------------
     traffic = dict(_outer_traffic(flow, itemsize, out_itemsize))
+    workspace_ring = (
+        flow.execution_graph.mode
+        in (ExecutionMode.MIX_SPLIT_M, ExecutionMode.MIX_SPLIT_N)
+        and flow.execution_graph.ring_space == "GM"
+    )
+    workspace_bytes = (
+        flow.loops.m * flow.loops.n * flow.loops.batch * out_itemsize
+        if workspace_ring
+        else 0.0
+    )
+    if workspace_ring:
+        traffic["workspace_ring_bytes"] = workspace_bytes
+        traffic["mte2_bytes"] += workspace_bytes
     if simt is not None:
         traffic["mte2_bytes"] += simt.cache_fill_bytes
         traffic["simt_datacache_fill_bytes"] = simt.cache_fill_bytes
@@ -1906,6 +2023,7 @@ def evaluate(
             logical_store_bytes,
             traffic["_c_drains"] * arch.pipe("MTE3").min_burst_bytes,
         )
+        mte3_bytes += workspace_bytes
     traffic["vector_bytes"] = vector_bytes
     traffic["mte3_bytes"] = mte3_bytes
 
@@ -1931,6 +2049,7 @@ def evaluate(
         mte2_bpc = min(mte2_bpc, hbm_bpc / flow.cores)
 
     dram_bytes = _dram_bytes(flow, arch, traffic, itemsize, out_itemsize, options)
+    dram_bytes += 2.0 * workspace_bytes
     if simt is not None:
         dram_bytes += simt.hbm_fill_bytes
     traffic["dram_bytes"] = dram_bytes
@@ -1962,6 +2081,7 @@ def evaluate(
         mte2_bpc,
         mte2_derate,
         simt,
+        options.cross_core_sync_cycles,
     )
 
     t_min = (
