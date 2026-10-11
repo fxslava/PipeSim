@@ -1,0 +1,84 @@
+{
+  "name": "ker05_mxfp4_expert_gemv_3",
+  "op_type": "vector_gemv",
+  "loops": {
+    "m": 512,
+    "n": 1,
+    "k": 2048,
+    "batch": 1
+  },
+  "tile": {
+    "tile_m": 3,
+    "tile_n": 1,
+    "tile_k": 2048,
+    "sub_m": 3,
+    "sub_n": 1,
+    "sub_k": 2048
+  },
+  "a": {
+    "name": "weights",
+    "shape": [
+      512,
+      2048
+    ],
+    "dtype": "fp16",
+    "space": "GM",
+    "layout": "ND",
+    "description": ""
+  },
+  "b": {
+    "name": "input",
+    "shape": [
+      2048
+    ],
+    "dtype": "fp16",
+    "space": "GM",
+    "layout": "ND",
+    "description": ""
+  },
+  "c": {
+    "name": "output",
+    "shape": [
+      512
+    ],
+    "dtype": "fp16",
+    "space": "GM",
+    "layout": "ND",
+    "description": ""
+  },
+  "buffers": {
+    "l1_depth": 2,
+    "l0_depth": 2,
+    "l0c_depth": 1,
+    "ub_depth": 2
+  },
+  "loop_order": "M_first",
+  "k_position": "inner",
+  "output_path": "fixpipe_ub_mte3",
+  "epilogue": [],
+  "transpose_a": false,
+  "transpose_b": false,
+  "cores": 1,
+  "notes": "",
+  "simt": {
+    "threads": 128,
+    "instructions_per_thread": 40,
+    "memory_ops_per_thread": 8,
+    "bytes_per_access": 0.5,
+    "stride_bytes": 0.5,
+    "working_set_bytes": 557056,
+    "branch_efficiency": 1.0,
+    "l2_hit_rate": 0.75,
+    "per_outer_tile": true,
+    "registers_per_thread": 40,
+    "vf_dispatches_per_phase": 3,
+    "shuffle_ops_per_thread": 5,
+    "direct_gm_loads": true
+  },
+  "execution_graph": {
+    "mode": "hybrid_simt_simd",
+    "ring_slots": 1,
+    "ring_space": "UB",
+    "vector_consumers": 1
+  }
+}

@@ -69,18 +69,36 @@ class FlowValidationError(ValueError):
 
 @dataclass(frozen=True)
 class SimtWorkload:
-    """Warp prefill/packing work fused with a Vector or GEMV tile."""
+    """Warp prefill/packing work fused with a Vector or GEMV tile.
+
+    ``bytes_per_access`` and ``stride_bytes`` are fractional-safe: a packed
+    MXFP4 pair shares one byte between two threads, so each thread's access
+    is 0.5 B on a 0.5 B stride and a whole warp's slice spans 16 B of one
+    DataCache line.
+    """
 
     threads: int
     instructions_per_thread: int
     memory_ops_per_thread: int
-    bytes_per_access: int
-    stride_bytes: int
+    bytes_per_access: float
+    stride_bytes: float
     working_set_bytes: int
     branch_efficiency: float = 1.0
     l2_hit_rate: float = 0.75
     per_outer_tile: bool = True
     registers_per_thread: int = 32
+    #: ``asc_vf_call`` dispatch boundaries per phase (an outer tile when
+    #: ``per_outer_tile``).  Each pays the shared-ALU SIMD<->SIMT mode-switch
+    #: penalty; the Stage-1 fleet's per-row GEMV dispatches set this to the
+    #: row count.  Only charged in ``hybrid_simt_simd`` mode.
+    vf_dispatches_per_phase: int = 1
+    #: Warp butterfly shuffles (``asc_shfl_xor``) per thread: register-
+    #: resident reductions - shared-ALU issue cycles, zero SRAM traffic.
+    shuffle_ops_per_thread: int = 0
+    #: ``True`` when warp threads read GM straight into registers through the
+    #: SIMT DataCache (UB bypass).  ``False`` stages the working set through
+    #: a classical MTE2 DMA burst into UB first.
+    direct_gm_loads: bool = True
 
     def __post_init__(self) -> None:
         if (
@@ -88,11 +106,11 @@ class SimtWorkload:
                 self.threads,
                 self.instructions_per_thread,
                 self.memory_ops_per_thread,
-                self.bytes_per_access,
-                self.stride_bytes,
                 self.working_set_bytes,
             )
             <= 0
+            or self.bytes_per_access <= 0
+            or self.stride_bytes <= 0
         ):
             raise FlowValidationError(
                 "SIMT workload counts and byte sizes must be positive"
@@ -103,6 +121,10 @@ class SimtWorkload:
             raise FlowValidationError("registers_per_thread must be positive")
         if not 0 <= self.l2_hit_rate <= 1:
             raise FlowValidationError("l2_hit_rate must be in [0, 1]")
+        if self.vf_dispatches_per_phase < 0:
+            raise FlowValidationError("vf_dispatches_per_phase must be >= 0")
+        if self.shuffle_ops_per_thread < 0:
+            raise FlowValidationError("shuffle_ops_per_thread must be >= 0")
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -116,6 +138,9 @@ class SimtWorkload:
             "l2_hit_rate": self.l2_hit_rate,
             "per_outer_tile": self.per_outer_tile,
             "registers_per_thread": self.registers_per_thread,
+            "vf_dispatches_per_phase": self.vf_dispatches_per_phase,
+            "shuffle_ops_per_thread": self.shuffle_ops_per_thread,
+            "direct_gm_loads": self.direct_gm_loads,
         }
 
     @classmethod
@@ -910,6 +935,14 @@ class AlgorithmFlow:
         in_dt, out_dt = DType.parse(dtype), DType.parse(out_dtype)
         if not 1 <= tile_rows <= rows:
             raise FlowValidationError("tile_rows must be between 1 and rows")
+        # A fused SIMT phase makes this a hybrid SIMD/SIMT execution graph:
+        # the shared Vector ALU alternates between the two issue modes at
+        # every ``asc_vf_call`` boundary, which the schedule prices in.
+        graph = (
+            ExecutionGraph(mode=ExecutionMode.HYBRID_SIMT_SIMD)
+            if simt is not None
+            else ExecutionGraph()
+        )
         return cls(
             name=name,
             op_type=OpType.VECTOR_GEMV,
@@ -920,6 +953,7 @@ class AlgorithmFlow:
             c=TensorSpec("output", (rows,), out_dt),
             buffers=buffers or BufferPlan.double(),
             simt=simt,
+            execution_graph=graph,
             output_path=OutputPath.FIXPIPE_UB_MTE3,
         )
 

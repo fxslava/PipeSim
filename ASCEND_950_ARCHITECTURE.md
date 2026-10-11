@@ -54,6 +54,22 @@ simultaneous DMA/cache fills and SIMD reads; the report includes
 register file and the documented launch-size limits; estimated spills add
 Vector issue work and UB-port traffic.
 
+Hybrid VF dispatch accounting: every `asc_vf_call` boundary reconfigures the
+physically shared Vector ALU between SIMD and SIMT warp issue.
+`SimtHardware.vf_mode_switch_penalty_cycles` (default 64, validated inside
+the measured 30..80-cycle window) prices each boundary, and
+`SimtWorkload.vf_dispatches_per_phase` counts them per outer tile, so a
+per-row dispatch GEMV carries `rows x 64` cycles inside the VECTOR stage.
+`SimtWorkload.shuffle_ops_per_thread` models warp butterfly shuffles
+(`asc_shfl_xor`) as register-resident reductions - shared-ALU issue cycles
+with zero SRAM traffic - and `direct_gm_loads=False` swaps the DataCache
+path for a classical MTE2 DMA staging burst (`simt_mte2_staged_bytes`).
+Fractional `bytes_per_access`/`stride_bytes` (0.5 B for packed MXFP4 pairs)
+let the coalescing model share one cache line across adjacent lanes.
+`AlgorithmFlow.vector_gemv(..., simt=...)` lowers to the
+`hybrid_simt_simd` execution graph, which is the only mode charged for
+switches.
+
 The CLI accepts a serialized `AlgorithmFlow` for this path:
 `npu-pipesim probe --arch ascend950pr --flow-file mhc_flow.json`.
 

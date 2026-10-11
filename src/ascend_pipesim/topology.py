@@ -427,6 +427,18 @@ class SimtHardware:
     ub_shared_bandwidth_bpc: float = 512.0
     register_file_bytes: int = 128 * KiB
     max_threads_per_core: int = 2048
+    #: Cycles the physically shared Vector ALU loses on each SIMD <-> SIMT
+    #: mode transition - an ``asc_vf_call`` dispatch boundary (drain, warp
+    #: reconfigure, drain back).  DaVinci v3 measured window is 30..80
+    #: cycles; 64 is the fleet default.
+    vf_mode_switch_penalty_cycles: float = 64.0
+
+    def __post_init__(self) -> None:
+        if not 30.0 <= self.vf_mode_switch_penalty_cycles <= 80.0:
+            raise ValueError(
+                "vf_mode_switch_penalty_cycles must stay inside the measured "
+                f"30..80 cycle window, got {self.vf_mode_switch_penalty_cycles}"
+            )
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -441,6 +453,7 @@ class SimtHardware:
             "ub_shared_bandwidth_bpc": self.ub_shared_bandwidth_bpc,
             "register_file_bytes": self.register_file_bytes,
             "max_threads_per_core": self.max_threads_per_core,
+            "vf_mode_switch_penalty_cycles": self.vf_mode_switch_penalty_cycles,
         }
 
 
@@ -870,8 +883,10 @@ def _ascend950pr() -> NpuArchitecture:
         vector=_vector_unit(bytes_per_cycle=512.0),
         hbm_bandwidth_gbps=1600.0,
         l2_capacity_bytes=128 * MiB,
-        simt=SimtHardware(),
+        simt=SimtHardware(vf_mode_switch_penalty_cycles=64.0),
         notes="950PR arch35 AIV tensor ceiling is 216 KiB of 256 KiB physical UB. "
+        "SIMT VF dispatches pay the 64-cycle (30..80 measured) shared-ALU "
+        "mode-switch penalty per asc_vf_call boundary. "
         "The 28/56, 112 GB and 112 MB L2 variants also exist. "
         "Frequency and local DMA rates are analytical estimates.",
     )

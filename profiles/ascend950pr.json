@@ -17,7 +17,8 @@
     "hbm_fill_cycles_estimate": 200,
     "ub_shared_bandwidth_bpc_estimate": 512,
     "simt_register_file_bytes": 131072,
-    "max_threads_per_vector_core": 2048
+    "max_threads_per_vector_core": 2048,
+    "vf_mode_switch_penalty_cycles_estimate": 64
   },
   "notes": "Default bin from the 2026 Ascend 950 NPU architecture whitepaper. Local MTE/NDDMA/CV bandwidths, latencies, core frequency, and per-cycle dtype rates, local alignments, and sync penalty are analytical modeling assumptions inferred from the published relative/aggregate throughput, not whitepaper instruction timing specifications. UB is 512 KiB per AI subsystem across two 256 KiB Vector cores, not 512 KiB independently per Vector core.",
   "system": {

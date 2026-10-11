@@ -297,11 +297,22 @@ def _render_probe_text(report: EvaluationReport) -> str:
         f"({report.timing_us['total_us']:.2f} us, {throughput} on one core)"
     )
     if report.simt is not None:
-        lines.append(
+        simt_line = (
             f"  Vector ALU {report.vector_alu_utilization_pct:.1f}% busy; "
             f"SIMT DataCache miss rate {report.simt.cache_miss_rate:.1%}; "
             f"UB shared port {sched.ub_port_cycles_per_step:.1f} cyc/step"
         )
+        if report.simt.vf_mode_switch_cycles > 0:
+            simt_line += (
+                f"; VF mode switches {report.simt.vf_mode_switch_cycles:,.0f} cyc "
+                f"over {report.simt.phases} phase(s)"
+            )
+        if not report.simt.direct_gm_loads:
+            simt_line += (
+                f"; MTE2 staged {report.simt.mte2_staged_bytes:,.0f} B "
+                "(no direct GM->register loads)"
+            )
+        lines.append(simt_line)
 
     if report.violations:
         lines.append("")

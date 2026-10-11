@@ -253,6 +253,17 @@ class SimtEstimate:
     divergence_factor: float
     register_limit_per_thread: int
     spill_bytes: float
+    #: Shared-ALU cycles lost to SIMD<->SIMT mode transitions at
+    #: ``asc_vf_call`` dispatch boundaries (hybrid mode only).
+    vf_mode_switch_cycles: float = 0.0
+    #: Shared-ALU issue cycles of warp butterfly shuffles (``asc_shfl_xor``);
+    #: register-resident, so they carry no SRAM traffic.
+    warp_shuffle_cycles: float = 0.0
+    #: ``True``: GM reads land in registers through the SIMT DataCache.
+    #: ``False``: the working set is staged by MTE2 into UB first.
+    direct_gm_loads: bool = True
+    #: UB staging bytes the MTE2 path moves when ``direct_gm_loads`` is off.
+    mte2_staged_bytes: float = 0.0
 
     @property
     def cache_miss_rate(self) -> float:
@@ -273,6 +284,10 @@ class SimtEstimate:
             "divergence_factor": round(self.divergence_factor, 3),
             "register_limit_per_thread": self.register_limit_per_thread,
             "spill_bytes": round(self.spill_bytes, 2),
+            "vf_mode_switch_cycles": round(self.vf_mode_switch_cycles, 2),
+            "warp_shuffle_cycles": round(self.warp_shuffle_cycles, 2),
+            "direct_gm_loads": self.direct_gm_loads,
+            "mte2_staged_bytes": round(self.mte2_staged_bytes, 2),
         }
 
 
@@ -321,11 +336,18 @@ def _estimate_simt(
     )
     misses = min(transactions, max(0.0, misses + transactions * miss_rate_drift))
     hbm_misses = misses * (1.0 - work.l2_hit_rate)
+    # Warp butterfly shuffles issue on the shared Vector ALU but resolve in
+    # registers: charged as issue cycles only, never as SRAM traffic.
+    shuffle_cycles = (
+        warps * work.shuffle_ops_per_thread * phases
+        / (hw.warp_schedulers * work.branch_efficiency)
+    )
     alu = (
         warps
         * (work.instructions_per_thread + 2 * spilled_registers)
         * phases
         / (hw.warp_schedulers * work.branch_efficiency)
+        + shuffle_cycles
     )
     parallel_fills = max(1, hw.warp_schedulers * hw.outstanding_fills_per_scheduler)
     latency = (
@@ -338,6 +360,24 @@ def _estimate_simt(
     )
     requested = (
         active_lanes * work.memory_ops_per_thread * work.bytes_per_access * phases
+    )
+    # Classic MTE2 staging replaces the DataCache path: the working set rides
+    # a DMA burst into UB, so cache traffic disappears and the staging bytes
+    # land on the MTE2 stage and the UB shared port instead.
+    direct_gm_loads = work.direct_gm_loads
+    if not direct_gm_loads:
+        transactions = misses = hbm_misses = latency = 0.0
+    mte2_staged_bytes = (
+        0.0 if direct_gm_loads else float(work.working_set_bytes) * phases
+    )
+    # Each asc_vf_call boundary reconfigures the physically shared Vector ALU
+    # between SIMD and SIMT warp issue; only the hybrid execution graph pays.
+    vf_switch_cycles = (
+        phases
+        * work.vf_dispatches_per_phase
+        * hw.vf_mode_switch_penalty_cycles
+        if flow.execution_graph.mode is ExecutionMode.HYBRID_SIMT_SIMD
+        else 0.0
     )
     return SimtEstimate(
         warps=warps,
@@ -352,6 +392,10 @@ def _estimate_simt(
         divergence_factor=1.0 / work.branch_efficiency,
         register_limit_per_thread=register_limit,
         spill_bytes=spill_bytes,
+        vf_mode_switch_cycles=vf_switch_cycles,
+        warp_shuffle_cycles=shuffle_cycles,
+        direct_gm_loads=direct_gm_loads,
+        mte2_staged_bytes=mte2_staged_bytes,
     )
 
 
@@ -1267,7 +1311,12 @@ def _tier3_schedule(
                 "VECTOR",
                 (
                     _safe_div(vector_bytes, steps * arch.vector.bytes_per_cycle)
-                    + (simt.vector_alu_cycles / steps if simt else 0.0)
+                    + (
+                        (simt.vector_alu_cycles + simt.vf_mode_switch_cycles)
+                        / steps
+                        if simt
+                        else 0.0
+                    )
                 )
                 * vector_share,
                 vector_bytes,
@@ -1311,7 +1360,10 @@ def _tier3_schedule(
     ub_port = 0.0
     if simt is not None and arch.simt is not None:
         ub_port = _safe_div(
-            simt.cache_fill_bytes + simt.spill_bytes + vector_bytes,
+            simt.cache_fill_bytes
+            + simt.spill_bytes
+            + simt.mte2_staged_bytes
+            + vector_bytes,
             steps * arch.simt.ub_shared_bandwidth_bpc,
         )
         if ub_port > steady:
@@ -1782,13 +1834,19 @@ def _evaluate_elemwise(
         vector_bytes = (in_bytes + out_bytes) * ops_per_elem
         total_flops = int(elements * ops_per_elem)
     simt_fill = simt.cache_fill_bytes if simt else 0.0
-    simt_alu = simt.vector_alu_cycles if simt else 0.0
+    simt_staged = simt.mte2_staged_bytes if simt else 0.0
+    simt_alu = (
+        simt.vector_alu_cycles + simt.vf_mode_switch_cycles if simt else 0.0
+    )
 
     stages = (
         PipelineStage(
             "MTE2",
-            _safe_div(in_bytes + simt_fill, steps * arch.pipe("MTE2_UB").bandwidth_bpc),
-            in_bytes + simt_fill,
+            _safe_div(
+                in_bytes + simt_fill + simt_staged,
+                steps * arch.pipe("MTE2_UB").bandwidth_bpc,
+            ),
+            in_bytes + simt_fill + simt_staged,
             plan.ub_depth >= 2,
             plan.ub_depth,
         ),
@@ -1815,7 +1873,7 @@ def _evaluate_elemwise(
     ub_port = 0.0
     if simt is not None and arch.simt is not None:
         ub_port = _safe_div(
-            in_bytes + simt_fill + simt.spill_bytes + vector_bytes,
+            in_bytes + simt_fill + simt_staged + simt.spill_bytes + vector_bytes,
             steps * arch.simt.ub_shared_bandwidth_bpc,
         )
         steady = max(steady, ub_port)
@@ -1934,6 +1992,10 @@ def _evaluate_elemwise(
             "vector_bytes": vector_bytes,
             "simt_datacache_fill_bytes": simt_fill,
             "simt_hbm_bytes": simt.hbm_fill_bytes if simt else 0.0,
+            "simt_vf_switch_cycles": (
+                simt.vf_mode_switch_cycles if simt else 0.0
+            ),
+            "simt_mte2_staged_bytes": simt_staged,
         },
         tile=flow.tile.to_dict(),
         timing_us={
@@ -2001,9 +2063,11 @@ def evaluate(
         traffic["workspace_ring_bytes"] = workspace_bytes
         traffic["mte2_bytes"] += workspace_bytes
     if simt is not None:
-        traffic["mte2_bytes"] += simt.cache_fill_bytes
+        traffic["mte2_bytes"] += simt.cache_fill_bytes + simt.mte2_staged_bytes
         traffic["simt_datacache_fill_bytes"] = simt.cache_fill_bytes
         traffic["simt_hbm_bytes"] = simt.hbm_fill_bytes
+        traffic["simt_vf_switch_cycles"] = simt.vf_mode_switch_cycles
+        traffic["simt_mte2_staged_bytes"] = simt.mte2_staged_bytes
     traffic["mte1_bytes"] = work.mte1_bytes
     # The Fixpipe reads 4 B/element from L0C and writes out_itemsize to the
     # destination, so the wider of the two sides sets its service time.
