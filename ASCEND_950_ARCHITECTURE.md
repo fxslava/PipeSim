@@ -24,7 +24,7 @@ Four AI CPU clusters each contain **two** Linx816 ARMv8-A cores with two hardwar
 | Cube L1 buffer | **512 KiB per AI subsystem/core** | Stage reusable A/B panels before MTE1 loads. |
 | L0A / L0B | **64 KiB each** | Cube operand fractals, conventionally Zz for A and Nz for B. |
 | L0C | **256 KiB**, FP32/INT32 accumulator | Each output element consumes 4 B; account for queue depth. This doubles the 128 KiB older-generation budget. |
-| Unified Buffer | **512 KiB per AI subsystem** | Shared aggregate of the two Vector cores; interpret as **UB0/UB1, 256 KiB each**, rather than 512 KiB independently per Vector core. Eight-bank, 32 B interleave is the kernel-model bank rule. |
+| Unified Buffer | **512 KiB per AI subsystem** | Shared aggregate of the two Vector cores: **256 KiB physical per AIV**. For the 950PR arch35 preset, the usable tensor ceiling is **216 KiB per AIV** after 8 KiB compiler reserve and 32 KiB minimum SIMT DataCache. Eight-bank, 32 B interleave is the kernel-model bank rule. |
 | L2 cache | **Up to 128 MB** globally addressable UMA cache | Distributed banks, die-local affinity, hardware coherence across AI Dies, **512 B cache lines** with **four 128 B sectors**. A reduced 950PR bin has 112 MB. |
 | Package memory | 950PR up to **128 GB / 1.6 TB/s**; 950DT up to **144 GB / 4.0 TB/s** | Package-attached high-speed memory, not an ordinary external DIMM. Supports online ECC, patrol, spare rows, and dynamic row isolation. |
 
@@ -35,6 +35,27 @@ L2 software controls include **allocate/non-allocate L2 hints** for reuse and ev
 The Cube supports **TF32, FP16, BF16, FP8 E5M2/E4M3, MXFP8, HiF8, MXFP4, and INT8**. At the same frequency, FP8/MXFP8/HiF8 tensor peak is **2× FP16**, and MXFP4 is **4× FP16** (section 4.1.1). HiF8 uses tapered precision, spans exponent positions **−22 through +15** (38 powers of two), and does not require the separate 8-bit MX scale of MXFP8 (section 4.1.1). Cube result conversion can run inline from FP32/INT32 L0C to BF16/FP16/FP8/INT8 in UB, with NZ-to-ND/DN layout conversion. For mixed-precision kernels, budget scale metadata and quantization intermediates in addition to packed operand bytes.
 
 The Vector core adds a register file between UB and ALU, dual-issue SIMD with out-of-order execution, plus SIMT for irregular control flow. A **Vector Function (VF)** can use SIMD or SIMT and switch between them. The paper reports **100% higher per-core FP16 and FP32 Vector peak** than the prior generation, as well as native BF16 and conversion instructions (sections 4.1.2–4.1.3). Model the 1:2 Cube-to-Vector ratio when partitioning work: each Cube subsystem feeds two Vector cores.
+
+`AlgorithmFlow.vector_gemv(..., simt=SimtWorkload(...))` models a fused SIMT
+packing phase and SIMD GEMV on an AIV. The report exposes warp count, branch
+divergence factor, cache transaction and miss estimates, coalescing factor,
+DataCache fill traffic, and shared Vector ALU utilization. The 950PR preset
+uses the documented 32-thread warp, four warp schedulers and 128-byte GM
+transaction granularity. Cache hit and fill latencies are configurable
+analytical estimates in `SimtHardware`; they are not measured instruction
+latencies. MTE2 and SIMT cache fills share bandwidth in the schedule, while
+SIMT and SIMD instructions contribute to one Vector stage. The minimum 200
+cycle MTE2 startup and pipeline fill/drain terms remain visible for one- and
+two-tile sweeps.
+The configurable shared UB-port throughput imposes a further lower bound on
+simultaneous DMA/cache fills and SIMD reads; the report includes
+`ub_port_cycles_per_step` so this contention can be inspected directly.
+`SimtWorkload.registers_per_thread` is checked against the 128 KiB SIMT
+register file and the documented launch-size limits; estimated spills add
+Vector issue work and UB-port traffic.
+
+The CLI accepts a serialized `AlgorithmFlow` for this path:
+`npu-pipesim probe --arch ascend950pr --flow-file mhc_flow.json`.
 
 | PipeSim analytical dtype | Element storage | Cube model | Fractal K0 |
 | --- | ---: | ---: | ---: |

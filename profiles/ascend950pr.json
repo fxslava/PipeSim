@@ -4,9 +4,21 @@
   "display_name": "Ascend 950PR (DaVinci v3)",
   "isa_generation": "davinci_v3",
   "aliases": [
-    "950pr"
+    "950pr", "arch35", "dav-3510"
   ],
   "provisional": false,
+  "simt": {
+    "warp_size": 32,
+    "warp_schedulers": 4,
+    "datacache_min_bytes": 32768,
+    "cache_line_bytes": 128,
+    "cache_hit_cycles_estimate": 8,
+    "l2_fill_cycles_estimate": 80,
+    "hbm_fill_cycles_estimate": 200,
+    "ub_shared_bandwidth_bpc_estimate": 512,
+    "simt_register_file_bytes": 131072,
+    "max_threads_per_vector_core": 2048
+  },
   "notes": "Default bin from the 2026 Ascend 950 NPU architecture whitepaper. Local MTE/NDDMA/CV bandwidths, latencies, core frequency, and per-cycle dtype rates, local alignments, and sync penalty are analytical modeling assumptions inferred from the published relative/aggregate throughput, not whitepaper instruction timing specifications. UB is 512 KiB per AI subsystem across two 256 KiB Vector cores, not 512 KiB independently per Vector core.",
   "system": {
     "ai_cores": 32,
@@ -55,14 +67,14 @@
       "description": "FP32/INT32 accumulator; 4 B per element, allocations are whole 16x16 fp32 fractals (1024 B)."
     },
     "UB": {
-      "size_bytes": 524288,
+      "size_bytes": 221184,
       "alignment_bytes": 32,
       "size_alignment_bytes": 32,
       "stride_alignment_bytes": 32,
       "banks": 8,
       "bank_stride_bytes": 32,
       "ports": 2,
-      "description": "Aggregate 512 KiB per AI subsystem: UB0/UB1 256 KiB per Vector core; 8-way 32 B bank interleave."
+      "description": "AIV tensor budget: 216 KiB usable of 256 KiB physical UB after 8 KiB compiler reserve and 32 KiB SIMT DataCache floor; 8-way 32 B bank interleave."
     }
   },
   "transfer_channels": {

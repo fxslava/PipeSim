@@ -10,12 +10,14 @@ from .dsl import (
     EpilogueOp,
     LoopNest,
     OpType,
+    SimtWorkload,
     TileConfig,
 )
-from .evaluator import EvaluationReport, EvalOptions, evaluate
+from .evaluator import EvaluationReport, EvalOptions, SimtEstimate, evaluate
 from .topology import (
     DType,
     NpuArchitecture,
+    SimtHardware,
     get_architecture,
     list_architectures,
 )
@@ -23,14 +25,31 @@ from .topology import (
 __all__ = [
     "__version__",
     # dsl
-    "AlgorithmFlow", "BufferPlan", "EpilogueOp", "LoopNest", "OpType",
+    "AlgorithmFlow",
+    "BufferPlan",
+    "EpilogueOp",
+    "LoopNest",
+    "OpType",
     "TileConfig",
+    "SimtWorkload",
     # topology
-    "DType", "NpuArchitecture", "get_architecture", "list_architectures",
+    "DType",
+    "NpuArchitecture",
+    "SimtHardware",
+    "get_architecture",
+    "list_architectures",
     # evaluator
-    "EvaluationReport", "EvalOptions", "evaluate",
+    "EvaluationReport",
+    "EvalOptions",
+    "SimtEstimate",
+    "evaluate",
     # autotiler
-    "AutotileOptions", "AutotileResult", "autotile", "autotile_gemm",
+    "AutotileOptions",
+    "AutotileResult",
+    "autotile",
+    "autotile_gemm",
     # codegen
-    "KernelBundle", "synthesize", "synthesize_kernel",
+    "KernelBundle",
+    "synthesize",
+    "synthesize_kernel",
 ]

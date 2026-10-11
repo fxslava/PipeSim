@@ -37,18 +37,15 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from typing import Any, Dict, Iterable, List, Mapping, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Sequence, Tuple
 
 from .dsl import (
     AlgorithmFlow,
-    BufferPlan,
     KPosition,
     LoopOrder,
     OpType,
-    OutputPath,
-    TileConfig,
 )
-from .topology import DType, NpuArchitecture, get_architecture
+from .topology import NpuArchitecture, get_architecture
 
 __all__ = [
     "Severity",
@@ -59,6 +56,7 @@ __all__ = [
     "HierarchicalRoofline",
     "PipelineStage",
     "PipelineSchedule",
+    "SimtEstimate",
     "EvaluationReport",
     "EvalOptions",
     "evaluate",
@@ -211,9 +209,7 @@ class HierarchicalRoofline:
         return {
             "total_flops": self.total_flops,
             "peak_flops_per_cycle": self.peak_flops_per_cycle,
-            "attainable_flops_per_cycle": round(
-                self.attainable_flops_per_cycle, 2
-            ),
+            "attainable_flops_per_cycle": round(self.attainable_flops_per_cycle, 2),
             "roofline_efficiency_pct": round(self.roofline_efficiency_pct, 2),
             "binding_level": self.binding_level,
             "levels": {lvl.level: lvl.to_dict() for lvl in self.levels},
@@ -241,6 +237,121 @@ class PipelineStage:
 
 
 @dataclass(frozen=True)
+class SimtEstimate:
+    """Warp issue and DataCache traffic for fused SIMT work."""
+
+    warps: int
+    phases: int
+    vector_alu_cycles: float
+    cache_latency_cycles: float
+    cache_transactions: float
+    cache_misses: float
+    cache_fill_bytes: float
+    hbm_fill_bytes: float
+    coalescing_factor: float
+    divergence_factor: float
+    register_limit_per_thread: int
+    spill_bytes: float
+
+    @property
+    def cache_miss_rate(self) -> float:
+        return _safe_div(self.cache_misses, self.cache_transactions)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "warps": self.warps,
+            "phases": self.phases,
+            "vector_alu_cycles": round(self.vector_alu_cycles, 2),
+            "cache_latency_cycles": round(self.cache_latency_cycles, 2),
+            "cache_transactions": round(self.cache_transactions, 2),
+            "cache_misses": round(self.cache_misses, 2),
+            "cache_miss_rate": round(self.cache_miss_rate, 4),
+            "cache_fill_bytes": round(self.cache_fill_bytes, 2),
+            "hbm_fill_bytes": round(self.hbm_fill_bytes, 2),
+            "coalescing_factor": round(self.coalescing_factor, 3),
+            "divergence_factor": round(self.divergence_factor, 3),
+            "register_limit_per_thread": self.register_limit_per_thread,
+            "spill_bytes": round(self.spill_bytes, 2),
+        }
+
+
+def _estimate_simt(flow: AlgorithmFlow, arch: NpuArchitecture) -> SimtEstimate | None:
+    if flow.simt is None:
+        return None
+    hw = arch.simt
+    if hw is None:
+        raise ValueError(f"{arch.name} has no SIMT hardware profile")
+    work = flow.simt
+    if work.threads > hw.max_threads_per_core:
+        raise ValueError(
+            f"SIMT thread count {work.threads} exceeds {hw.max_threads_per_core} "
+            f"threads per {arch.name} Vector core"
+        )
+    phases = flow.tile.n_outer_tiles * flow.loops.batch if work.per_outer_tile else 1
+    warps = _ceil_div(work.threads, hw.warp_size)
+    thread_limit = (
+        127
+        if work.threads <= 256
+        else 64
+        if work.threads <= 512
+        else 32
+        if work.threads <= 1024
+        else 16
+    )
+    register_limit = min(thread_limit, hw.register_file_bytes // (work.threads * 4))
+    spilled_registers = max(0, work.registers_per_thread - register_limit)
+    spill_bytes = float(spilled_registers * 4 * work.threads * phases)
+    active_lanes = min(work.threads, warps * hw.warp_size)
+    span = (hw.warp_size - 1) * work.stride_bytes + work.bytes_per_access
+    lines_per_warp = _ceil_div(span, hw.cache_line_bytes)
+    transactions = float(warps * work.memory_ops_per_thread * lines_per_warp * phases)
+    # The first access to each line is cold; subsequent memory operations
+    # revisit the same per-warp footprint unless capacity evicts it.
+    cold_lines = min(
+        transactions,
+        _ceil_div(work.working_set_bytes, hw.cache_line_bytes) * phases,
+        warps * lines_per_warp * phases,
+    )
+    capacity_fraction = max(0.0, 1.0 - hw.datacache_bytes / work.working_set_bytes)
+    misses = min(
+        transactions, cold_lines + (transactions - cold_lines) * capacity_fraction
+    )
+    hbm_misses = misses * (1.0 - work.l2_hit_rate)
+    alu = (
+        warps
+        * (work.instructions_per_thread + 2 * spilled_registers)
+        * phases
+        / (hw.warp_schedulers * work.branch_efficiency)
+    )
+    parallel_fills = max(1, hw.warp_schedulers * hw.outstanding_fills_per_scheduler)
+    latency = (
+        transactions * hw.cache_hit_cycles / hw.warp_schedulers
+        + (
+            misses * hw.l2_fill_cycles
+            + hbm_misses * (hw.hbm_fill_cycles - hw.l2_fill_cycles)
+        )
+        / parallel_fills
+    )
+    requested = (
+        active_lanes * work.memory_ops_per_thread * work.bytes_per_access * phases
+    )
+    return SimtEstimate(
+        warps=warps,
+        phases=phases,
+        vector_alu_cycles=alu,
+        cache_latency_cycles=latency,
+        cache_transactions=transactions,
+        cache_misses=misses,
+        cache_fill_bytes=misses * hw.cache_line_bytes,
+        hbm_fill_bytes=hbm_misses * hw.cache_line_bytes,
+        coalescing_factor=_safe_div(transactions * hw.cache_line_bytes, requested),
+        divergence_factor=1.0 / work.branch_efficiency,
+        register_limit_per_thread=register_limit,
+        spill_bytes=spill_bytes,
+    )
+
+
+@dataclass(frozen=True)
 class PipelineSchedule:
     """Outcome of the Tier-3 max-plus analysis."""
 
@@ -256,6 +367,7 @@ class PipelineSchedule:
     limiting_stage: str
     secondary_stage: str
     slack_pct: float
+    ub_port_cycles_per_step: float = 0.0
 
     @property
     def cube_utilization_pct(self) -> float:
@@ -266,6 +378,13 @@ class PipelineSchedule:
     def cube_busy_pct(self) -> float:
         """Cycles the Cube is issuing anything, padding included."""
         return 100.0 * _safe_div(self.issued_cube_cycles, self.total_cycles)
+
+    @property
+    def vector_alu_utilization_pct(self) -> float:
+        busy = sum(
+            s.cycles_per_step * self.steps for s in self.stages if s.name == "VECTOR"
+        )
+        return min(100.0, 100.0 * _safe_div(busy, self.total_cycles))
 
     def stage(self, name: str) -> PipelineStage:
         for st in self.stages:
@@ -295,8 +414,7 @@ class PipelineSchedule:
         reduces to ``sum(tau_u) / max(tau_u)``, so ``Omega > 2.0`` certifies
         that three or more stages are concurrently active.
         """
-        return _safe_div(self.total_stage_cycles,
-                         self.steady_state_cycles_per_step)
+        return _safe_div(self.total_stage_cycles, self.steady_state_cycles_per_step)
 
     @property
     def latency_hiding_pct(self) -> float:
@@ -316,9 +434,7 @@ class PipelineSchedule:
     def to_dict(self) -> Dict[str, Any]:
         return {
             "steps": self.steps,
-            "steady_state_cycles_per_step": round(
-                self.steady_state_cycles_per_step, 4
-            ),
+            "steady_state_cycles_per_step": round(self.steady_state_cycles_per_step, 4),
             "total_stage_cycles": round(self.total_stage_cycles, 4),
             "concurrency_ratio": round(self.concurrency_ratio, 3),
             "latency_hiding_pct": round(self.latency_hiding_pct, 2),
@@ -331,8 +447,10 @@ class PipelineSchedule:
             "limiting_stage": self.limiting_stage,
             "secondary_stage": self.secondary_stage,
             "slack_pct": round(self.slack_pct, 2),
+            "ub_port_cycles_per_step": round(self.ub_port_cycles_per_step, 4),
             "cube_utilization_pct": round(self.cube_utilization_pct, 2),
             "cube_busy_pct": round(self.cube_busy_pct, 2),
+            "vector_alu_utilization_pct": round(self.vector_alu_utilization_pct, 2),
             "stages": {st.name: st.to_dict() for st in self.stages},
         }
 
@@ -357,11 +475,16 @@ class EvaluationReport:
     traffic: Dict[str, float]
     tile: Dict[str, int]
     timing_us: Dict[str, float]
+    simt: SimtEstimate | None = None
 
     # -- headline metrics --------------------------------------------------
     @property
     def cube_utilization_pct(self) -> float:
         return self.schedule.cube_utilization_pct
+
+    @property
+    def vector_alu_utilization_pct(self) -> float:
+        return self.schedule.vector_alu_utilization_pct
 
     @property
     def limiting_stage(self) -> str:
@@ -386,6 +509,7 @@ class EvaluationReport:
             "summary": self.summary,
             "is_valid": self.is_valid,
             "cube_utilization_pct": round(self.cube_utilization_pct, 2),
+            "vector_alu_utilization_pct": round(self.vector_alu_utilization_pct, 2),
             "limiting_stage": self.limiting_stage,
             "concurrency_ratio": round(self.schedule.concurrency_ratio, 3),
             "latency_hiding_pct": round(self.schedule.latency_hiding_pct, 2),
@@ -394,6 +518,7 @@ class EvaluationReport:
             "tile": self.tile,
             "hierarchical_roofline": self.roofline.to_dict(),
             "pipeline": self.schedule.to_dict(),
+            "simt": self.simt.to_dict() if self.simt else None,
             "sram_footprints": {
                 k: v.to_dict() for k, v in self.sram_footprints.items()
             },
@@ -481,10 +606,10 @@ def _resident_traffic(
 class _AxisClass:
     """One equivalence class of tiles along a single axis."""
 
-    extent: int           # real extent of this tile
-    multiplicity: int     # how many tiles share this extent
-    n_subs: int           # subtiles inside it
-    padded_total: int     # sum of fractal-padded subtile lengths
+    extent: int  # real extent of this tile
+    multiplicity: int  # how many tiles share this extent
+    n_subs: int  # subtiles inside it
+    padded_total: int  # sum of fractal-padded subtile lengths
 
 
 def _axis_classes(extent: int, tile: int, sub: int, gran: int) -> List[_AxisClass]:
@@ -526,9 +651,7 @@ class _InnerWork:
     max_l0c_elements: int
 
 
-def _inner_work(
-    flow: AlgorithmFlow, k0: int, itemsize: int
-) -> _InnerWork:
+def _inner_work(flow: AlgorithmFlow, k0: int, itemsize: int) -> _InnerWork:
     """Exact Cube and MTE1 totals, accounting for tails at both tile levels.
 
     The inner nest is ``for sk: for s_outer: for s_inner:`` where the outer
@@ -601,7 +724,10 @@ def _tier1_footprints(
     b_tile = l1.aligned_size(_pad(t.tile_k, k0) * _pad(t.tile_n, 16) * itemsize)
     l1_bytes = (a_tile + b_tile) * plan.l1_depth
     footprints["L1"] = SramFootprint(
-        "L1", l1_bytes, l1.capacity_bytes, plan.l1_depth,
+        "L1",
+        l1_bytes,
+        l1.capacity_bytes,
+        plan.l1_depth,
         {"A_tile": a_tile, "B_tile": b_tile},
     )
 
@@ -611,11 +737,17 @@ def _tier1_footprints(
     a_sub = l0a.aligned_size(work.max_l0a_elements * itemsize)
     b_sub = l0b.aligned_size(work.max_l0b_elements * itemsize)
     footprints["L0A"] = SramFootprint(
-        "L0A", a_sub * plan.l0_depth, l0a.capacity_bytes, plan.l0_depth,
+        "L0A",
+        a_sub * plan.l0_depth,
+        l0a.capacity_bytes,
+        plan.l0_depth,
         {"A_subtile": a_sub},
     )
     footprints["L0B"] = SramFootprint(
-        "L0B", b_sub * plan.l0_depth, l0b.capacity_bytes, plan.l0_depth,
+        "L0B",
+        b_sub * plan.l0_depth,
+        l0b.capacity_bytes,
+        plan.l0_depth,
         {"B_subtile": b_sub},
     )
 
@@ -623,7 +755,10 @@ def _tier1_footprints(
     l0c = arch.pool("L0C")
     acc_bytes = l0c.aligned_size(work.max_l0c_elements * 4)
     footprints["L0C"] = SramFootprint(
-        "L0C", acc_bytes * plan.l0c_depth, l0c.capacity_bytes, plan.l0c_depth,
+        "L0C",
+        acc_bytes * plan.l0c_depth,
+        l0c.capacity_bytes,
+        plan.l0c_depth,
         {"accumulator_fp32": acc_bytes},
     )
 
@@ -666,9 +801,7 @@ def _tier1_footprints(
                 )
             )
 
-    violations.extend(
-        _alignment_violations(flow, arch, k0, itemsize, out_itemsize)
-    )
+    violations.extend(_alignment_violations(flow, arch, k0, itemsize, out_itemsize))
     return footprints, violations
 
 
@@ -682,18 +815,27 @@ def _tier1_footprints_elemwise(
     plan = flow.buffers
     tile_elems = flow.tile.tile_m
     n_in = flow.elemwise_inputs
-    in_bytes = ub.aligned_size(tile_elems * itemsize) * n_in
+    if flow.op_type is OpType.VECTOR_GEMV:
+        in_bytes = ub.aligned_size(
+            tile_elems * flow.loops.k * itemsize
+        ) + ub.aligned_size(flow.loops.k * itemsize)
+    else:
+        in_bytes = ub.aligned_size(tile_elems * itemsize) * n_in
     out_bytes = ub.aligned_size(tile_elems * out_itemsize)
     total = (in_bytes + out_bytes) * plan.ub_depth
     fp = SramFootprint(
-        "UB", total, ub.capacity_bytes, plan.ub_depth,
+        "UB",
+        total,
+        ub.capacity_bytes,
+        plan.ub_depth,
         {"inputs": in_bytes, "output": out_bytes},
     )
     violations: List[Violation] = []
     if not fp.fits:
         violations.append(
             Violation(
-                "UB_OVERFLOW", Severity.ERROR,
+                "UB_OVERFLOW",
+                Severity.ERROR,
                 f"UB needs {total} B at depth {plan.ub_depth} but only "
                 f"{ub.capacity_bytes} B exist",
                 {"required_bytes": total, "capacity_bytes": ub.capacity_bytes},
@@ -718,7 +860,8 @@ def _alignment_violations(
     if k0 * itemsize != 32:
         out.append(
             Violation(
-                "FRACTAL_ROW_NOT_32B", Severity.WARNING,
+                "FRACTAL_ROW_NOT_32B",
+                Severity.WARNING,
                 f"fractal row is {k0 * itemsize} B (k0={k0}, itemsize="
                 f"{itemsize}); DaVinci fractals are 32 B rows",
                 {"k0": k0, "itemsize": itemsize},
@@ -726,14 +869,18 @@ def _alignment_violations(
         )
 
     for axis, value, gran in (
-        ("tile_m", t.tile_m, 16), ("tile_n", t.tile_n, 16),
+        ("tile_m", t.tile_m, 16),
+        ("tile_n", t.tile_n, 16),
         ("tile_k", t.tile_k, k0),
-        ("sub_m", t.sub_m, 16), ("sub_n", t.sub_n, 16), ("sub_k", t.sub_k, k0),
+        ("sub_m", t.sub_m, 16),
+        ("sub_n", t.sub_n, 16),
+        ("sub_k", t.sub_k, k0),
     ):
         if value % gran:
             out.append(
                 Violation(
-                    "TILE_NOT_FRACTAL_ALIGNED", Severity.WARNING,
+                    "TILE_NOT_FRACTAL_ALIGNED",
+                    Severity.WARNING,
                     f"{axis}={value} is not a multiple of {gran}; the Cube "
                     f"will issue padded fractals",
                     {"axis": axis, "value": value, "granularity": gran},
@@ -748,12 +895,15 @@ def _alignment_violations(
         if extent % tile:
             out.append(
                 Violation(
-                    "RAGGED_TILE_BOUNDARY", Severity.WARNING,
+                    "RAGGED_TILE_BOUNDARY",
+                    Severity.WARNING,
                     f"{axis}={extent} is not divisible by tile={tile}; the "
                     f"last tile is {extent % tile} wide and needs runtime "
                     f"tail handling (SetTail)",
                     {
-                        "axis": axis, "extent": extent, "tile": tile,
+                        "axis": axis,
+                        "extent": extent,
+                        "tile": tile,
                         "tail": extent % tile,
                         "requires_set_tail": True,
                     },
@@ -771,7 +921,8 @@ def _alignment_violations(
         if run % gm_align:
             out.append(
                 Violation(
-                    "GM_BURST_UNALIGNED", Severity.WARNING,
+                    "GM_BURST_UNALIGNED",
+                    Severity.WARNING,
                     f"operand {operand}: the contiguous DataCopy run is "
                     f"{run} B, not a multiple of the {gm_align} B GM burst; "
                     f"MTE2/Fixpipe will waste partial bursts",
@@ -779,9 +930,7 @@ def _alignment_violations(
                         "operand": operand,
                         "run_bytes": run,
                         "burst_bytes": gm_align,
-                        "burst_efficiency": round(
-                            run / (_pad(run, gm_align) or 1), 3
-                        ),
+                        "burst_efficiency": round(run / (_pad(run, gm_align) or 1), 3),
                     },
                 )
             )
@@ -791,7 +940,8 @@ def _alignment_violations(
         if not op.is_hardware_supported():
             out.append(
                 Violation(
-                    "FIXPIPE_EPILOGUE_UNSUPPORTED", Severity.ERROR,
+                    "FIXPIPE_EPILOGUE_UNSUPPORTED",
+                    Severity.ERROR,
                     f"epilogue {op.kind!r} is scheduled on the Fixpipe but "
                     f"the hardware only folds in "
                     f"{sorted(op.FIXPIPE_CAPABLE)}; move it to the Vector unit",
@@ -807,7 +957,8 @@ def _alignment_violations(
         if factor > 1.0:
             out.append(
                 Violation(
-                    "UB_BANK_CONFLICT", Severity.WARNING,
+                    "UB_BANK_CONFLICT",
+                    Severity.WARNING,
                     f"UB row stride {stride} B maps onto "
                     f"{ub.banks // max(1, int(factor))} of {ub.banks} banks; "
                     f"expect a {factor:.1f}x Vector slowdown. Pad the row.",
@@ -929,9 +1080,7 @@ def _tier2_roofline(
                 bytes_moved=moved,
                 intensity_flops_per_byte=intensity,
                 bandwidth_bpc=bpc,
-                ceiling_flops_per_cycle=(
-                    intensity * bpc if moved > 0 else math.inf
-                ),
+                ceiling_flops_per_cycle=(intensity * bpc if moved > 0 else math.inf),
             )
         )
 
@@ -985,6 +1134,7 @@ def _tier3_schedule(
     macs_per_cycle: float,
     mte2_bpc: float,
     mte2_derate: float,
+    simt: SimtEstimate | None = None,
 ) -> PipelineSchedule:
     """Steady-state ``T_iter = max_s tau_s`` with depth-aware serialisation.
 
@@ -1029,17 +1179,21 @@ def _tier3_schedule(
             plan.l0c_depth,
         ),
     ]
-    if flow.uses_unified_buffer:
+    if flow.uses_unified_buffer or simt is not None:
         vector_overlapped = arch.decoupled_vector_core and plan.ub_depth >= 2
         stages.append(
             PipelineStage(
                 "VECTOR",
-                _safe_div(vector_bytes, steps * arch.vector.bytes_per_cycle),
+                (
+                    _safe_div(vector_bytes, steps * arch.vector.bytes_per_cycle)
+                    + (simt.vector_alu_cycles / steps if simt else 0.0)
+                ),
                 vector_bytes,
                 vector_overlapped,
                 plan.ub_depth,
             )
         )
+    if flow.uses_unified_buffer:
         stages.append(
             PipelineStage(
                 "MTE3",
@@ -1054,6 +1208,14 @@ def _tier3_schedule(
     serialised = [s for s in stages if not s.overlapped]
     steady = max((s.cycles_per_step for s in overlapped), default=0.0)
     steady += sum(s.cycles_per_step for s in serialised)
+    ub_port = 0.0
+    if simt is not None and arch.simt is not None:
+        ub_port = _safe_div(
+            simt.cache_fill_bytes + simt.spill_bytes + vector_bytes,
+            steps * arch.simt.ub_shared_bandwidth_bpc,
+        )
+        if ub_port > steady:
+            steady = ub_port
 
     ranked = sorted(stages, key=lambda s: s.cycles_per_step, reverse=True)
     top = ranked[0]
@@ -1064,31 +1226,42 @@ def _tier3_schedule(
     ideal_steady = max((s.cycles_per_step for s in stages), default=0.0)
     if serialised and steady > 1.2 * ideal_steady:
         limiting = "SERIALIZED_NO_DOUBLE_BUFFER"
+    elif ub_port >= steady and ub_port > ideal_steady:
+        limiting = "UB_PORT_CONTENTION"
     slack = 100.0 * (1.0 - _safe_div(second.cycles_per_step, top.cycles_per_step))
 
     # Pipeline fill: the first tile must traverse the whole chain unoverlapped.
+    # A short run cannot reach steady-state overlap before its final tile.
+    # Charge the noncritical parallel stages once for startup service; their
+    # service is otherwise hidden by max(tau) only after the pipeline fills.
+    parallel_service = sum(s.cycles_per_step for s in overlapped)
+    parallel_max = max((s.cycles_per_step for s in overlapped), default=0.0)
+    startup_service = max(0.0, parallel_service - parallel_max)
     fill = (
         arch.pipe("MTE2").base_latency_cycles
         + arch.pipe("MTE1").base_latency_cycles
         + cube.pipeline_latency_cycles
+        + startup_service
     )
+    if simt is not None:
+        fill += simt.cache_latency_cycles
     drain = arch.pipe("FIXPIPE").base_latency_cycles
     if flow.uses_unified_buffer:
         drain += arch.pipe("MTE3").base_latency_cycles
     # Every outer tile pays the GM latency again unless depth hides it.
     outer_tiles = flow.tile.n_outer_tiles * flow.loops.batch
     if plan.l1_depth < 2:
-        fill += outer_tiles * arch.pipe("MTE2").base_latency_cycles
+        fill += max(0, outer_tiles - 1) * arch.pipe("MTE2").base_latency_cycles
 
     total = steps * steady + fill + drain
-    serialized_total = (
-        steps * sum(s.cycles_per_step for s in stages)
-        + outer_tiles * (
-            arch.pipe("MTE2").base_latency_cycles
-            + arch.pipe("MTE1").base_latency_cycles
-            + arch.pipe("FIXPIPE").base_latency_cycles
-        )
+    serialized_total = steps * sum(s.cycles_per_step for s in stages) + outer_tiles * (
+        arch.pipe("MTE2").base_latency_cycles
+        + arch.pipe("MTE1").base_latency_cycles
+        + cube.pipeline_latency_cycles
+        + arch.pipe("FIXPIPE").base_latency_cycles
+        + (arch.pipe("MTE3").base_latency_cycles if flow.uses_unified_buffer else 0.0)
     )
+    serialized_total = max(serialized_total, total)
 
     return PipelineSchedule(
         stages=tuple(stages),
@@ -1103,6 +1276,7 @@ def _tier3_schedule(
         limiting_stage=limiting,
         secondary_stage=second.name,
         slack_pct=slack,
+        ub_port_cycles_per_step=ub_port,
     )
 
 
@@ -1300,8 +1474,7 @@ def _diagnostics(
         out.append(
             Diagnostic(
                 "LOW_UTILIZATION",
-                f"Cube utilisation is {util:.1f}% with no single dominant "
-                "stage.",
+                f"Cube utilisation is {util:.1f}% with no single dominant stage.",
                 "Run `npu-pipesim autotile` on this shape; the search "
                 "explores the tile space this configuration is missing.",
                 impact="medium",
@@ -1337,23 +1510,33 @@ def _code_generation_hints(
     inner_nest = ["sk", "sm", "sn"] if m_first else ["sk", "sn", "sm"]
 
     extents = {
-        "mo": t.n_tiles_m, "no": t.n_tiles_n, "ko": t.n_tiles_k,
-        "sm": t.n_subs_m, "sn": t.n_subs_n, "sk": t.n_subs_k,
+        "mo": t.n_tiles_m,
+        "no": t.n_tiles_n,
+        "ko": t.n_tiles_k,
+        "sm": t.n_subs_m,
+        "sn": t.n_subs_n,
+        "sk": t.n_subs_k,
     }
     pseudo = []
     indent = ""
     for name in outer_nest:
         pseudo.append(f"{indent}for {name} in range({extents[name]}):")
         indent += "  "
-    pseudo.append(f"{indent}CopyIn A[{t.tile_m}x{t.tile_k}], B[{t.tile_k}x{t.tile_n}]  // MTE2, Nd2Nz")
+    pseudo.append(
+        f"{indent}CopyIn A[{t.tile_m}x{t.tile_k}], B[{t.tile_k}x{t.tile_n}]  // MTE2, Nd2Nz"
+    )
     for name in inner_nest:
         pseudo.append(f"{indent}for {name} in range({extents[name]}):")
         indent += "  "
     pseudo.append(f"{indent}LoadData -> L0A/L0B  // MTE1")
-    pseudo.append(f"{indent}Mmad({t.sub_m}, {t.sub_n}, {t.sub_k})  // Cube, accumulate in L0C")
+    pseudo.append(
+        f"{indent}Mmad({t.sub_m}, {t.sub_n}, {t.sub_k})  // Cube, accumulate in L0C"
+    )
     indent = indent[: -2 * len(inner_nest)]
-    pseudo.append(f"{indent}Fixpipe L0C[{t.tile_m}x{t.tile_n}] -> "
-                  f"{'UB then MTE3' if flow.uses_unified_buffer else 'GM'}")
+    pseudo.append(
+        f"{indent}Fixpipe L0C[{t.tile_m}x{t.tile_n}] -> "
+        f"{'UB then MTE3' if flow.uses_unified_buffer else 'GM'}"
+    )
 
     requires_tail = t.has_tail() or t.has_sub_tail()
     hints: Dict[str, Any] = {
@@ -1364,9 +1547,12 @@ def _code_generation_hints(
         "inner_loop_nest": inner_nest,
         "loop_extents": extents,
         "pseudocode": pseudo,
-        "fractal": {"m0": 16, "n0": 16, "k0": k0,
-                    "note": f"{flow.compute_dtype.value} fractal rows are "
-                            f"{k0 * itemsize} B"},
+        "fractal": {
+            "m0": 16,
+            "n0": 16,
+            "k0": k0,
+            "note": f"{flow.compute_dtype.value} fractal rows are {k0 * itemsize} B",
+        },
         "requires_set_tail": requires_tail,
         "tail_sizes": {
             "m": t.tail_m if flow.loops.m % t.tile_m else 0,
@@ -1392,16 +1578,22 @@ def _code_generation_hints(
         ],
         "nd2nz": {
             "operand_a": {
-                "ndNum": 1, "nValue": t.tile_m, "dValue": t.tile_k,
+                "ndNum": 1,
+                "nValue": t.tile_m,
+                "dValue": t.tile_k,
                 "srcDValue": flow.loops.k,
                 "dstNzC0Stride": _pad(t.tile_m, 16),
-                "dstNzNStride": 1, "dstNzMatrixStride": 0,
+                "dstNzNStride": 1,
+                "dstNzMatrixStride": 0,
             },
             "operand_b": {
-                "ndNum": 1, "nValue": t.tile_k, "dValue": t.tile_n,
+                "ndNum": 1,
+                "nValue": t.tile_k,
+                "dValue": t.tile_n,
                 "srcDValue": flow.loops.n,
                 "dstNzC0Stride": _pad(t.tile_k, k0),
-                "dstNzNStride": 1, "dstNzMatrixStride": 0,
+                "dstNzNStride": 1,
+                "dstNzMatrixStride": 0,
             },
         },
         "epilogue_plan": [
@@ -1462,37 +1654,80 @@ def _evaluate_elemwise(
     tile_elems = flow.tile.tile_m
     steps = _ceil_div(elements, tile_elems)
     plan = flow.buffers
+    simt = _estimate_simt(flow, arch)
 
     footprints, violations = _tier1_footprints_elemwise(
         flow, arch, itemsize, out_itemsize
     )
-    in_bytes = float(elements * itemsize * n_in)
+    if flow.op_type is OpType.VECTOR_GEMV:
+        in_bytes = float((elements + steps) * flow.loops.k * itemsize)
+    else:
+        in_bytes = float(elements * itemsize * n_in)
     out_bytes = float(elements * out_itemsize)
+    # A short store still occupies one minimum MTE3 transaction per tile.
+    store_burst = arch.pipe("MTE3").min_burst_bytes
+    full_tiles, tail = divmod(elements, tile_elems)
+    mte3_service_bytes = full_tiles * max(tile_elems * out_itemsize, store_burst) + (
+        max(tail * out_itemsize, store_burst) if tail else 0.0
+    )
     ops_per_elem = sum(op.ops_per_element for op in flow.epilogue) or 1.0
-    vector_bytes = (in_bytes + out_bytes) * ops_per_elem
+    if flow.op_type is OpType.VECTOR_GEMV:
+        vector_bytes = float(2 * elements * flow.loops.k * itemsize)
+        total_flops = int(2 * elements * flow.loops.k)
+    else:
+        vector_bytes = (in_bytes + out_bytes) * ops_per_elem
+        total_flops = int(elements * ops_per_elem)
+    simt_fill = simt.cache_fill_bytes if simt else 0.0
+    simt_alu = simt.vector_alu_cycles if simt else 0.0
 
-    total_flops = int(elements * ops_per_elem)
     stages = (
         PipelineStage(
-            "MTE2", _safe_div(in_bytes, steps * arch.pipe("MTE2_UB").bandwidth_bpc),
-            in_bytes, plan.ub_depth >= 2, plan.ub_depth,
+            "MTE2",
+            _safe_div(in_bytes + simt_fill, steps * arch.pipe("MTE2_UB").bandwidth_bpc),
+            in_bytes + simt_fill,
+            plan.ub_depth >= 2,
+            plan.ub_depth,
         ),
         PipelineStage(
             "VECTOR",
-            _safe_div(vector_bytes, steps * arch.vector.bytes_per_cycle),
-            vector_bytes, True, plan.ub_depth,
+            _safe_div(vector_bytes, steps * arch.vector.bytes_per_cycle)
+            + simt_alu / steps,
+            vector_bytes,
+            True,
+            plan.ub_depth,
         ),
         PipelineStage(
-            "MTE3", _safe_div(out_bytes, steps * arch.pipe("MTE3").bandwidth_bpc),
-            out_bytes, plan.ub_depth >= 2, plan.ub_depth,
+            "MTE3",
+            _safe_div(mte3_service_bytes, steps * arch.pipe("MTE3").bandwidth_bpc),
+            mte3_service_bytes,
+            plan.ub_depth >= 2,
+            plan.ub_depth,
         ),
     )
     overlapped = [s for s in stages if s.overlapped]
     serialised = [s for s in stages if not s.overlapped]
     steady = max((s.cycles_per_step for s in overlapped), default=0.0)
     steady += sum(s.cycles_per_step for s in serialised)
+    ub_port = 0.0
+    if simt is not None and arch.simt is not None:
+        ub_port = _safe_div(
+            in_bytes + simt_fill + simt.spill_bytes + vector_bytes,
+            steps * arch.simt.ub_shared_bandwidth_bpc,
+        )
+        steady = max(steady, ub_port)
     ranked = sorted(stages, key=lambda s: s.cycles_per_step, reverse=True)
-    fill = arch.pipe("MTE2_UB").base_latency_cycles
+    # The first tile traverses every parallel stage before any steady-state
+    # overlap is possible; this term matters most for one or two tile runs.
+    parallel_service = sum(s.cycles_per_step for s in overlapped)
+    startup_service = max(
+        0.0,
+        parallel_service - max((s.cycles_per_step for s in overlapped), default=0.0),
+    )
+    fill = (
+        arch.pipe("MTE2_UB").base_latency_cycles
+        + startup_service
+        + (simt.cache_latency_cycles if simt else 0.0)
+    )
     drain = arch.pipe("MTE3").base_latency_cycles
     total = steps * steady + fill + drain
 
@@ -1503,23 +1738,37 @@ def _evaluate_elemwise(
         fill_cycles=fill,
         drain_cycles=drain,
         total_cycles=total,
-        serialized_cycles=steps * sum(s.cycles_per_step for s in stages)
-        + steps * (fill + drain),
+        serialized_cycles=max(
+            total,
+            steps
+            * (
+                sum(s.cycles_per_step for s in stages)
+                + arch.pipe("MTE2_UB").base_latency_cycles
+                + arch.pipe("MTE3").base_latency_cycles
+            ),
+        ),
         ideal_cube_cycles=0.0,
         issued_cube_cycles=0.0,
-        limiting_stage=_STAGE_TO_BOTTLENECK.get(ranked[0].name, ranked[0].name),
+        limiting_stage=(
+            "UB_PORT_CONTENTION"
+            if ub_port > ranked[0].cycles_per_step
+            else _STAGE_TO_BOTTLENECK.get(ranked[0].name, ranked[0].name)
+        ),
         secondary_stage=ranked[1].name,
         slack_pct=100.0
         * (1.0 - _safe_div(ranked[1].cycles_per_step, ranked[0].cycles_per_step)),
+        ub_port_cycles_per_step=ub_port,
     )
 
-    moved = in_bytes + out_bytes
+    moved = in_bytes + out_bytes + simt_fill
     roofline = HierarchicalRoofline(
         total_flops=total_flops,
         peak_flops_per_cycle=arch.vector.bytes_per_cycle / max(1, out_itemsize),
         levels=(
             RooflineLevel(
-                "GM_MTE2", moved, _safe_div(total_flops, moved),
+                "GM_MTE2",
+                moved,
+                _safe_div(total_flops, moved),
                 arch.pipe("MTE2_UB").bandwidth_bpc,
                 _safe_div(total_flops, moved) * arch.pipe("MTE2_UB").bandwidth_bpc,
             ),
@@ -1531,7 +1780,7 @@ def _evaluate_elemwise(
     diagnostics = [
         Diagnostic(
             "MEMORY_BOUND_ELEMWISE",
-            "Element-wise kernels are bandwidth bound by construction "
+            "Vector kernels move "
             f"({moved / 1024:.0f} KiB moved for {total_flops} ops).",
             "Fuse this op into the producer or consumer kernel so the UB "
             "round trip disappears.",
@@ -1543,7 +1792,7 @@ def _evaluate_elemwise(
         flow_name=flow.name,
         arch_name=arch.name,
         summary=(
-            f"{flow.name}: elementwise, {schedule.limiting_stage}, "
+            f"{flow.name}: {flow.op_type.value}, {schedule.limiting_stage}, "
             f"{moved / max(us, 1e-9) / 1e3:.0f} GB/s single core"
         ),
         is_valid=not any(v.is_fatal for v in violations),
@@ -1561,22 +1810,33 @@ def _evaluate_elemwise(
             "ub_depth": plan.ub_depth,
             "pseudocode": [
                 f"for i in range({steps}):",
-                f"  DataCopy(gm -> ub, {tile_elems} elems) x{n_in}  // MTE2",
-                "  Vector op on UB",
+                (
+                    f"  DataCopy(GEMV rows={tile_elems}, K={flow.loops.k})  // MTE2"
+                    if flow.op_type is OpType.VECTOR_GEMV
+                    else f"  DataCopy(gm -> ub, {tile_elems} elems) x{n_in}  // MTE2"
+                ),
+                (
+                    "  SIMD GEMV reduction on UB"
+                    if flow.op_type is OpType.VECTOR_GEMV
+                    else "  Vector op on UB"
+                ),
                 "  DataCopy(ub -> gm)  // MTE3",
             ],
             "requires_set_tail": elements % tile_elems != 0,
         },
         traffic={
-            "mte2_bytes": in_bytes,
-            "mte3_bytes": out_bytes,
+            "mte2_bytes": in_bytes + simt_fill,
+            "mte3_bytes": mte3_service_bytes,
             "vector_bytes": vector_bytes,
+            "simt_datacache_fill_bytes": simt_fill,
+            "simt_hbm_bytes": simt.hbm_fill_bytes if simt else 0.0,
         },
         tile=flow.tile.to_dict(),
         timing_us={
             "total_us": us,
             "achieved_gbps_single_core": moved / max(us, 1e-9) / 1e3,
         },
+        simt=simt,
     )
 
 
@@ -1597,8 +1857,9 @@ def evaluate(
     """
     arch = get_architecture(arch)
     options = options or EvalOptions()
+    simt = _estimate_simt(flow, arch)
 
-    if flow.op_type is OpType.ELEMWISE:
+    if flow.op_type in (OpType.ELEMWISE, OpType.VECTOR_GEMV):
         return _evaluate_elemwise(flow, arch, options)
 
     dtype = flow.compute_dtype
@@ -1622,6 +1883,10 @@ def evaluate(
 
     # -- traffic -----------------------------------------------------------
     traffic = dict(_outer_traffic(flow, itemsize, out_itemsize))
+    if simt is not None:
+        traffic["mte2_bytes"] += simt.cache_fill_bytes
+        traffic["simt_datacache_fill_bytes"] = simt.cache_fill_bytes
+        traffic["simt_hbm_bytes"] = simt.hbm_fill_bytes
     traffic["mte1_bytes"] = work.mte1_bytes
     # The Fixpipe reads 4 B/element from L0C and writes out_itemsize to the
     # destination, so the wider of the two sides sets its service time.
@@ -1634,11 +1899,13 @@ def evaluate(
     vector_bytes = 0.0
     mte3_bytes = 0.0
     if flow.uses_unified_buffer:
-        n_vec_ops = sum(
-            op.ops_per_element for op in flow.vector_epilogue_ops()
-        ) or 1.0
+        n_vec_ops = sum(op.ops_per_element for op in flow.vector_epilogue_ops()) or 1.0
         vector_bytes = out_elements * (4 + out_itemsize) * n_vec_ops
-        mte3_bytes = out_elements * out_itemsize
+        logical_store_bytes = out_elements * out_itemsize
+        mte3_bytes = max(
+            logical_store_bytes,
+            traffic["_c_drains"] * arch.pipe("MTE3").min_burst_bytes,
+        )
     traffic["vector_bytes"] = vector_bytes
     traffic["mte3_bytes"] = mte3_bytes
 
@@ -1651,31 +1918,50 @@ def evaluate(
     a_run = (tile.tile_m if flow.transpose_a else tile.tile_k) * itemsize
     b_run = (tile.tile_k if flow.transpose_b else tile.tile_n) * itemsize
     a_w, b_w = traffic["mte2_a_bytes"], traffic["mte2_b_bytes"]
-    mte2_derate = _safe_div(
-        a_w + b_w,
-        a_w * (_pad(a_run, txn) / a_run) + b_w * (_pad(b_run, txn) / b_run),
-    ) or 1.0
+    mte2_derate = (
+        _safe_div(
+            a_w + b_w,
+            a_w * (_pad(a_run, txn) / a_run) + b_w * (_pad(b_run, txn) / b_run),
+        )
+        or 1.0
+    )
     mte2_bpc = arch.pipe("MTE2").bandwidth_bpc
     if options.model_hbm_contention and flow.cores > 1:
         hbm_bpc = arch.hbm_bandwidth_gbps * 1e9 / (arch.frequency_ghz * 1e9)
         mte2_bpc = min(mte2_bpc, hbm_bpc / flow.cores)
 
-    dram_bytes = _dram_bytes(
-        flow, arch, traffic, itemsize, out_itemsize, options
-    )
+    dram_bytes = _dram_bytes(flow, arch, traffic, itemsize, out_itemsize, options)
+    if simt is not None:
+        dram_bytes += simt.hbm_fill_bytes
     traffic["dram_bytes"] = dram_bytes
     traffic.pop("_c_drains", None)
 
     # -- Tier 2 ------------------------------------------------------------
     roofline = _tier2_roofline(
-        flow, arch, traffic, work.mte1_bytes, fixpipe_bytes, dram_bytes,
-        float(profile.flops_per_cycle), mte2_bpc, options,
+        flow,
+        arch,
+        traffic,
+        work.mte1_bytes,
+        fixpipe_bytes,
+        dram_bytes,
+        float(profile.flops_per_cycle),
+        mte2_bpc,
+        options,
     )
 
     # -- Tier 3 ------------------------------------------------------------
     schedule = _tier3_schedule(
-        flow, arch, work, traffic, fixpipe_bytes, vector_bytes, mte3_bytes,
-        macs_per_cycle, mte2_bpc, mte2_derate,
+        flow,
+        arch,
+        work,
+        traffic,
+        fixpipe_bytes,
+        vector_bytes,
+        mte3_bytes,
+        macs_per_cycle,
+        mte2_bpc,
+        mte2_derate,
+        simt,
     )
 
     t_min = (
@@ -1732,4 +2018,5 @@ def evaluate(
         traffic=traffic,
         tile=flow.tile.to_dict(),
         timing_us=timing,
+        simt=simt,
     )

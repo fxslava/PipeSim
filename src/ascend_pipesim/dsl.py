@@ -50,6 +50,7 @@ __all__ = [
     "TileConfig",
     "BufferPlan",
     "EpilogueOp",
+    "SimtWorkload",
     "AlgorithmFlow",
     "FlowValidationError",
 ]
@@ -62,6 +63,62 @@ class FlowValidationError(ValueError):
     subtile larger than its tile).  Hardware *capacity* violations are not
     errors here -- they are Tier-1 findings reported by the evaluator.
     """
+
+
+@dataclass(frozen=True)
+class SimtWorkload:
+    """Warp prefill/packing work fused with a Vector or GEMV tile."""
+
+    threads: int
+    instructions_per_thread: int
+    memory_ops_per_thread: int
+    bytes_per_access: int
+    stride_bytes: int
+    working_set_bytes: int
+    branch_efficiency: float = 1.0
+    l2_hit_rate: float = 0.75
+    per_outer_tile: bool = True
+    registers_per_thread: int = 32
+
+    def __post_init__(self) -> None:
+        if (
+            min(
+                self.threads,
+                self.instructions_per_thread,
+                self.memory_ops_per_thread,
+                self.bytes_per_access,
+                self.stride_bytes,
+                self.working_set_bytes,
+            )
+            <= 0
+        ):
+            raise FlowValidationError(
+                "SIMT workload counts and byte sizes must be positive"
+            )
+        if not 0 < self.branch_efficiency <= 1:
+            raise FlowValidationError("branch_efficiency must be in (0, 1]")
+        if self.registers_per_thread <= 0:
+            raise FlowValidationError("registers_per_thread must be positive")
+        if not 0 <= self.l2_hit_rate <= 1:
+            raise FlowValidationError("l2_hit_rate must be in [0, 1]")
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "threads": self.threads,
+            "instructions_per_thread": self.instructions_per_thread,
+            "memory_ops_per_thread": self.memory_ops_per_thread,
+            "bytes_per_access": self.bytes_per_access,
+            "stride_bytes": self.stride_bytes,
+            "working_set_bytes": self.working_set_bytes,
+            "branch_efficiency": self.branch_efficiency,
+            "l2_hit_rate": self.l2_hit_rate,
+            "per_outer_tile": self.per_outer_tile,
+            "registers_per_thread": self.registers_per_thread,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "SimtWorkload":
+        return cls(**data)
 
 
 class OpType(str, Enum):
@@ -78,6 +135,9 @@ class OpType(str, Enum):
 
     ELEMWISE = "elemwise"
     """Vector-only kernel: GM -> UB -> (Vector) -> UB -> GM."""
+
+    VECTOR_GEMV = "vector_gemv"
+    """Vector-core GEMV: weight rows and one input vector, reduced in UB."""
 
 
 class Layout(str, Enum):
@@ -218,9 +278,7 @@ class LoopNest:
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "LoopNest":
-        return cls(
-            m=data["m"], n=data["n"], k=data["k"], batch=data.get("batch", 1)
-        )
+        return cls(m=data["m"], n=data["n"], k=data["k"], batch=data.get("batch", 1))
 
 
 def _ceil_div(a: int, b: int) -> int:
@@ -253,12 +311,13 @@ class TileConfig:
                 raise FlowValidationError(f"{name}={value} must be positive")
             object.__setattr__(self, name, value)
         for sub, tile in (
-            ("sub_m", "tile_m"), ("sub_n", "tile_n"), ("sub_k", "tile_k")
+            ("sub_m", "tile_m"),
+            ("sub_n", "tile_n"),
+            ("sub_k", "tile_k"),
         ):
             if getattr(self, sub) > getattr(self, tile):
                 raise FlowValidationError(
-                    f"{sub}={getattr(self, sub)} exceeds "
-                    f"{tile}={getattr(self, tile)}"
+                    f"{sub}={getattr(self, sub)} exceeds {tile}={getattr(self, tile)}"
                 )
 
     def bind(self, loops: LoopNest) -> "TileConfig":
@@ -350,21 +409,33 @@ class TileConfig:
 
     def as_tuple(self) -> tuple[int, int, int, int, int, int]:
         return (
-            self.tile_m, self.tile_n, self.tile_k,
-            self.sub_m, self.sub_n, self.sub_k,
+            self.tile_m,
+            self.tile_n,
+            self.tile_k,
+            self.sub_m,
+            self.sub_n,
+            self.sub_k,
         )
 
     def to_dict(self) -> Dict[str, Any]:
         return {
-            "tile_m": self.tile_m, "tile_n": self.tile_n, "tile_k": self.tile_k,
-            "sub_m": self.sub_m, "sub_n": self.sub_n, "sub_k": self.sub_k,
+            "tile_m": self.tile_m,
+            "tile_n": self.tile_n,
+            "tile_k": self.tile_k,
+            "sub_m": self.sub_m,
+            "sub_n": self.sub_n,
+            "sub_k": self.sub_k,
         }
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "TileConfig":
         return cls(
-            tile_m=data["tile_m"], tile_n=data["tile_n"], tile_k=data["tile_k"],
-            sub_m=data["sub_m"], sub_n=data["sub_n"], sub_k=data["sub_k"],
+            tile_m=data["tile_m"],
+            tile_n=data["tile_n"],
+            tile_k=data["tile_k"],
+            sub_m=data["sub_m"],
+            sub_n=data["sub_n"],
+            sub_k=data["sub_k"],
         )
 
 
@@ -405,9 +476,13 @@ class BufferPlan:
     @classmethod
     def named(cls, name: str) -> "BufferPlan":
         table = {
-            "single": cls.single, "none": cls.single, "1": cls.single,
-            "double": cls.double, "2": cls.double,
-            "triple": cls.triple, "3": cls.triple,
+            "single": cls.single,
+            "none": cls.single,
+            "1": cls.single,
+            "double": cls.double,
+            "2": cls.double,
+            "triple": cls.triple,
+            "3": cls.triple,
         }
         key = str(name).strip().lower()
         if key not in table:
@@ -507,6 +582,7 @@ class AlgorithmFlow:
     #: Number of AI Cores the problem is split across (affects HBM share).
     cores: int = 1
     notes: str = ""
+    simt: SimtWorkload | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "op_type", OpType(self.op_type))
@@ -517,15 +593,19 @@ class AlgorithmFlow:
         object.__setattr__(self, "tile", self.tile.bind(self.loops))
         if self.cores < 1:
             raise FlowValidationError(f"cores={self.cores} must be >= 1")
-        if self.op_type is not OpType.ELEMWISE:
+        if self.op_type not in (OpType.ELEMWISE, OpType.VECTOR_GEMV):
             self._validate_gemm_shapes()
 
     def _validate_gemm_shapes(self) -> None:
-        expect_a = (self.loops.k, self.loops.m) if self.transpose_a else (
-            self.loops.m, self.loops.k
+        expect_a = (
+            (self.loops.k, self.loops.m)
+            if self.transpose_a
+            else (self.loops.m, self.loops.k)
         )
-        expect_b = (self.loops.n, self.loops.k) if self.transpose_b else (
-            self.loops.k, self.loops.n
+        expect_b = (
+            (self.loops.n, self.loops.k)
+            if self.transpose_b
+            else (self.loops.k, self.loops.n)
         )
         if self.a.shape[-2:] != expect_a:
             raise FlowValidationError(
@@ -558,6 +638,7 @@ class AlgorithmFlow:
         return (
             self.output_path is OutputPath.FIXPIPE_UB_MTE3
             or self.op_type is OpType.ELEMWISE
+            or self.op_type is OpType.VECTOR_GEMV
             or any(not op.runs_on_fixpipe for op in self.epilogue)
         )
 
@@ -608,6 +689,7 @@ class AlgorithmFlow:
         transpose_b: bool = False,
         cores: int = 1,
         name: str = "gemm",
+        simt: SimtWorkload | None = None,
     ) -> "AlgorithmFlow":
         """Build a (batched) GEMM flow from scalar parameters."""
         in_dt = DType.parse(dtype)
@@ -618,7 +700,8 @@ class AlgorithmFlow:
         b_shape = bshape + ((n, k) if transpose_b else (k, n))
         epilogue = tuple(epilogue)
         op_type = (
-            OpType.BATCH_GEMM if batch > 1
+            OpType.BATCH_GEMM
+            if batch > 1
             else OpType.GEMM_DEQUANT
             if any(op.kind == "dequant" for op in epilogue)
             else OpType.GEMM
@@ -643,6 +726,7 @@ class AlgorithmFlow:
             transpose_a=transpose_a,
             transpose_b=transpose_b,
             cores=cores,
+            simt=simt,
         )
 
     @classmethod
@@ -675,7 +759,8 @@ class AlgorithmFlow:
         scale_shape = (n,) if per_channel else (1,)
         ops: list[EpilogueOp] = [
             EpilogueOp(
-                "dequant", unit,
+                "dequant",
+                unit,
                 operand=TensorSpec("deq_scale", scale_shape, DType.FP32),
                 ops_per_element=1.0,
             )
@@ -683,7 +768,8 @@ class AlgorithmFlow:
         if bias:
             ops.append(
                 EpilogueOp(
-                    "bias", unit,
+                    "bias",
+                    unit,
                     operand=TensorSpec("bias", (n,), DType.INT32),
                     ops_per_element=1.0,
                 )
@@ -695,9 +781,16 @@ class AlgorithmFlow:
             OutputPath.FIXPIPE_UB_MTE3 if on_vector else OutputPath.FIXPIPE_GM,
         )
         return cls.gemm(
-            m=m, n=n, k=k, tile=tile, subtile=subtile,
-            dtype=in_dtype, out_dtype=out_dt,
-            epilogue=ops, name=name, **kwargs,
+            m=m,
+            n=n,
+            k=k,
+            tile=tile,
+            subtile=subtile,
+            dtype=in_dtype,
+            out_dtype=out_dt,
+            epilogue=ops,
+            name=name,
+            **kwargs,
         )
 
     @classmethod
@@ -712,6 +805,7 @@ class AlgorithmFlow:
         ops_per_element: float = 1.0,
         buffers: BufferPlan | None = None,
         name: str = "elemwise",
+        simt: SimtWorkload | None = None,
     ) -> "AlgorithmFlow":
         """A Vector-only kernel streaming GM -> UB -> GM.
 
@@ -726,6 +820,7 @@ class AlgorithmFlow:
         return cls(
             name=name,
             op_type=OpType.ELEMWISE,
+            simt=simt,
             loops=loops,
             tile=TileConfig(tile_elements, 1, 1, tile_elements, 1, 1),
             a=TensorSpec("X", (elements,), in_dt),
@@ -734,11 +829,39 @@ class AlgorithmFlow:
             buffers=buffers or BufferPlan.double(),
             output_path=OutputPath.FIXPIPE_UB_MTE3,
             epilogue=(
-                EpilogueOp(
-                    "elemwise", "vector", ops_per_element=ops_per_element
-                ),
+                EpilogueOp("elemwise", "vector", ops_per_element=ops_per_element),
             ),
             notes=f"n_inputs={n_inputs}",
+        )
+
+    @classmethod
+    def vector_gemv(
+        cls,
+        *,
+        rows: int,
+        columns: int,
+        tile_rows: int,
+        dtype: "str | DType" = DType.FP16,
+        out_dtype: "str | DType" = DType.FP32,
+        buffers: BufferPlan | None = None,
+        simt: SimtWorkload | None = None,
+        name: str = "vector_gemv",
+    ) -> "AlgorithmFlow":
+        """Build a SIMD GEMV with an optional fused SIMT packing phase."""
+        in_dt, out_dt = DType.parse(dtype), DType.parse(out_dtype)
+        if not 1 <= tile_rows <= rows:
+            raise FlowValidationError("tile_rows must be between 1 and rows")
+        return cls(
+            name=name,
+            op_type=OpType.VECTOR_GEMV,
+            loops=LoopNest(m=rows, n=1, k=columns),
+            tile=TileConfig(tile_rows, 1, columns, tile_rows, 1, columns),
+            a=TensorSpec("weights", (rows, columns), in_dt),
+            b=TensorSpec("input", (columns,), in_dt),
+            c=TensorSpec("output", (rows,), out_dt),
+            buffers=buffers or BufferPlan.double(),
+            simt=simt,
+            output_path=OutputPath.FIXPIPE_UB_MTE3,
         )
 
     @property
@@ -769,6 +892,7 @@ class AlgorithmFlow:
             "transpose_b": self.transpose_b,
             "cores": self.cores,
             "notes": self.notes,
+            "simt": self.simt.to_dict() if self.simt else None,
         }
 
     @classmethod
@@ -785,13 +909,12 @@ class AlgorithmFlow:
             loop_order=LoopOrder(data.get("loop_order", "M_first")),
             k_position=KPosition(data.get("k_position", "inner")),
             output_path=OutputPath(data.get("output_path", "fixpipe_gm")),
-            epilogue=tuple(
-                EpilogueOp.from_dict(op) for op in data.get("epilogue", [])
-            ),
+            epilogue=tuple(EpilogueOp.from_dict(op) for op in data.get("epilogue", [])),
             transpose_a=bool(data.get("transpose_a", False)),
             transpose_b=bool(data.get("transpose_b", False)),
             cores=int(data.get("cores", 1)),
             notes=data.get("notes", ""),
+            simt=SimtWorkload.from_dict(data["simt"]) if data.get("simt") else None,
         )
 
     def describe(self) -> str:

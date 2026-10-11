@@ -31,10 +31,10 @@ import json
 import sys
 from dataclasses import replace
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, TextIO
+from typing import Any, Dict, List, Mapping, Optional, Sequence, TextIO
 
 from .autotiler import AutotileOptions, AutotileResult, autotile
-from .codegen import KernelBundle, synthesize_kernel
+from .codegen import synthesize_kernel
 from .dsl import (
     AlgorithmFlow,
     BufferPlan,
@@ -82,9 +82,7 @@ def _int_triple(text: str) -> tuple[int, int, int]:
     try:
         values = tuple(int(p) for p in parts)
     except ValueError as exc:
-        raise argparse.ArgumentTypeError(
-            f"expected integers in {text!r}"
-        ) from exc
+        raise argparse.ArgumentTypeError(f"expected integers in {text!r}") from exc
     if any(v <= 0 for v in values):
         raise argparse.ArgumentTypeError(f"values must be positive: {text!r}")
     return values  # type: ignore[return-value]
@@ -92,16 +90,12 @@ def _int_triple(text: str) -> tuple[int, int, int]:
 
 def _key_value(text: str) -> tuple[str, float]:
     if "=" not in text:
-        raise argparse.ArgumentTypeError(
-            f"expected NAME=VALUE, got {text!r}"
-        )
+        raise argparse.ArgumentTypeError(f"expected NAME=VALUE, got {text!r}")
     name, _, value = text.partition("=")
     try:
         return name.strip().upper(), float(value)
     except ValueError as exc:
-        raise argparse.ArgumentTypeError(
-            f"{text!r}: value must be numeric"
-        ) from exc
+        raise argparse.ArgumentTypeError(f"{text!r}: value must be numeric") from exc
 
 
 def _resolve_architecture(args: argparse.Namespace) -> NpuArchitecture:
@@ -147,15 +141,14 @@ def _epilogue(args: argparse.Namespace) -> tuple[EpilogueOp, ...]:
     if getattr(args, "dequant", False):
         ops.append(
             EpilogueOp(
-                "dequant", unit,
+                "dequant",
+                unit,
                 operand=TensorSpec("deq_scale", (n,), DType.FP32),
             )
         )
     if getattr(args, "bias", False):
         ops.append(
-            EpilogueOp(
-                "bias", unit, operand=TensorSpec("bias", (n,), DType.INT32)
-            )
+            EpilogueOp("bias", unit, operand=TensorSpec("bias", (n,), DType.INT32))
         )
     if getattr(args, "relu", False):
         ops.append(EpilogueOp("relu", unit))
@@ -174,22 +167,29 @@ def _stationary_loop_order(args: argparse.Namespace) -> Optional[LoopOrder]:
 
 def _build_flow(args: argparse.Namespace) -> AlgorithmFlow:
     """Assemble an :class:`AlgorithmFlow` from parsed CLI arguments."""
+    flow_file = getattr(args, "flow_file", None)
+    if flow_file:
+        if args.gemm is not None:
+            raise ValueError("--flow-file and --gemm are mutually exclusive")
+        with open(flow_file, encoding="utf-8") as handle:
+            return AlgorithmFlow.from_dict(json.load(handle))
+    if args.gemm is None:
+        raise ValueError("provide --gemm or --flow-file")
     m, n, k = args.gemm
     epilogue = _epilogue(args)
     on_vector = getattr(args, "epilogue_on_vector", False)
     out_path = (
-        OutputPath.FIXPIPE_UB_MTE3
-        if on_vector and epilogue
-        else OutputPath.FIXPIPE_GM
+        OutputPath.FIXPIPE_UB_MTE3 if on_vector and epilogue else OutputPath.FIXPIPE_GM
     )
     tile = args.tile or (128, 128, 64)
-    subtile = args.subtile or (
-        min(tile[0], 64), min(tile[1], 64), min(tile[2], 32)
-    )
+    subtile = args.subtile or (min(tile[0], 64), min(tile[1], 64), min(tile[2], 32))
     loop_order = _stationary_loop_order(args) or LoopOrder(args.loop_order)
     return AlgorithmFlow.gemm(
-        m=m, n=n, k=k,
-        tile=tile, subtile=subtile,
+        m=m,
+        n=n,
+        k=k,
+        tile=tile,
+        subtile=subtile,
         dtype=args.dtype,
         out_dtype=args.out_dtype,
         batch=args.batch,
@@ -208,9 +208,7 @@ def _build_flow(args: argparse.Namespace) -> AlgorithmFlow:
 def _json_payload(args: argparse.Namespace, payload: Any) -> str:
     """Serialise JSON: indented by default or with --pretty, tight with
     --compact alone."""
-    compact = getattr(args, "compact", False) and not getattr(
-        args, "pretty", False
-    )
+    compact = getattr(args, "compact", False) and not getattr(args, "pretty", False)
     return json.dumps(payload, indent=None if compact else 2)
 
 
@@ -281,13 +279,22 @@ def _render_probe_text(report: EvaluationReport) -> str:
         f"  cube utilisation: {sched.cube_utilization_pct:.2f}% useful, "
         f"{sched.cube_busy_pct:.2f}% busy"
     )
+    throughput = (
+        f"{report.timing_us['achieved_tflops_single_core']:.2f} TFLOP/s"
+        if "achieved_tflops_single_core" in report.timing_us
+        else f"{report.timing_us['achieved_gbps_single_core']:.2f} GB/s"
+    )
     lines.append(
         f"  T_min {report.t_min_cycles:,.0f} <= T {sched.total_cycles:,.0f} "
         f"<= T_max {report.t_max_cycles:,.0f} cycles "
-        f"({report.timing_us['total_us']:.2f} us, "
-        f"{report.timing_us['achieved_tflops_single_core']:.2f} TFLOP/s "
-        f"on one core)"
+        f"({report.timing_us['total_us']:.2f} us, {throughput} on one core)"
     )
+    if report.simt is not None:
+        lines.append(
+            f"  Vector ALU {report.vector_alu_utilization_pct:.1f}% busy; "
+            f"SIMT DataCache miss rate {report.simt.cache_miss_rate:.1%}; "
+            f"UB shared port {sched.ub_port_cycles_per_step:.1f} cyc/step"
+        )
 
     if report.violations:
         lines.append("")
@@ -344,9 +351,7 @@ def run_probe(args: argparse.Namespace) -> tuple[int, str]:
         payload = _render_probe_text(report)
     else:
         payload = _json_payload(args, report.to_dict())
-    code = (
-        EXIT_INFEASIBLE if (args.strict and not report.is_valid) else EXIT_OK
-    )
+    code = EXIT_INFEASIBLE if (args.strict and not report.is_valid) else EXIT_OK
     return code, payload
 
 
@@ -377,12 +382,8 @@ def run_autotile(args: argparse.Namespace) -> tuple[int, str]:
     if args.format == "text":
         payload = _render_autotile_text(result)
     else:
-        payload = _json_payload(
-            args, result.to_dict(full_report=args.full_report)
-        )
-    code = (
-        EXIT_INFEASIBLE if (args.strict and result.best is None) else EXIT_OK
-    )
+        payload = _json_payload(args, result.to_dict(full_report=args.full_report))
+    code = EXIT_INFEASIBLE if (args.strict and result.best is None) else EXIT_OK
     return code, payload
 
 
@@ -414,17 +415,13 @@ def run_codegen(args: argparse.Namespace) -> tuple[int, str]:
                     "written": written,
                     "outdir": str(Path(outdir)),
                     "meta": bundle.meta,
-                    "buffers": {
-                        k: v.to_dict() for k, v in bundle.buffers.items()
-                    },
+                    "buffers": {k: v.to_dict() for k, v in bundle.buffers.items()},
                 },
             )
         else:
             payload = _json_payload(args, bundle.to_dict())
 
-    code = (
-        EXIT_INFEASIBLE if (args.strict and not report.is_valid) else EXIT_OK
-    )
+    code = EXIT_INFEASIBLE if (args.strict and not report.is_valid) else EXIT_OK
     return code, payload
 
 
@@ -493,24 +490,50 @@ def run_archs(args: argparse.Namespace) -> tuple[int, str]:
 def _rpc_namespace(params: Mapping[str, Any]) -> argparse.Namespace:
     """Turn an RPC params object into the namespace the commands expect."""
     defaults: Dict[str, Any] = {
-        "arch": "ascend910b", "arch_file": None,
-        "gemm": (512, 512, 512), "tile": None, "subtile": None,
-        "dtype": "fp16", "out_dtype": None, "batch": 1, "cores": 1,
+        "arch": "ascend910b",
+        "arch_file": None,
+        "gemm": (512, 512, 512),
+        "tile": None,
+        "subtile": None,
+        "dtype": "fp16",
+        "out_dtype": None,
+        "batch": 1,
+        "cores": 1,
         "buffers": "double",
-        "l1_depth": None, "l0_depth": None, "l0c_depth": None,
+        "l1_depth": None,
+        "l0_depth": None,
+        "l0c_depth": None,
         "ub_depth": None,
-        "loop_order": "M_first", "k_position": "inner", "stationary": None,
-        "dequant": False, "bias": False, "relu": False,
+        "loop_order": "M_first",
+        "k_position": "inner",
+        "stationary": None,
+        "dequant": False,
+        "bias": False,
+        "relu": False,
         "epilogue_on_vector": False,
-        "transpose_a": False, "transpose_b": False,
-        "name": "flow", "format": "json", "compact": True, "pretty": False,
-        "strict": False, "outdir": None,
-        "no_l2": False, "no_hbm_contention": False, "no_hints": False,
-        "pipe_bw": [], "pipe_latency": [], "pool_bytes": [],
+        "transpose_a": False,
+        "transpose_b": False,
+        "name": "flow",
+        "format": "json",
+        "compact": True,
+        "pretty": False,
+        "strict": False,
+        "outdir": None,
+        "no_l2": False,
+        "no_hbm_contention": False,
+        "no_hints": False,
+        "pipe_bw": [],
+        "pipe_latency": [],
+        "pool_bytes": [],
         "frequency": None,
-        "topk": 3, "max_tile": 512, "max_evaluations": 8000,
-        "forbid_tails": False, "include_infeasible": False,
-        "loop_orders": None, "buffer_plans": None, "time_budget": None,
+        "topk": 3,
+        "max_tile": 512,
+        "max_evaluations": 8000,
+        "forbid_tails": False,
+        "include_infeasible": False,
+        "loop_orders": None,
+        "buffer_plans": None,
+        "time_budget": None,
         "full_report": False,
     }
     defaults.update(params)
@@ -542,9 +565,7 @@ def _rpc_dispatch(method: str, params: Mapping[str, Any]) -> Any:
             orders = tuple(LoopOrder(o) for o in args.loop_orders)
         else:
             orders = (LoopOrder.M_FIRST, LoopOrder.N_FIRST)
-        plans = tuple(
-            BufferPlan.named(b) for b in (args.buffer_plans or ["double"])
-        )
+        plans = tuple(BufferPlan.named(b) for b in (args.buffer_plans or ["double"]))
         options = AutotileOptions(
             topk=args.topk,
             max_tile=args.max_tile,
@@ -593,9 +614,7 @@ def serve_rpc(stdin: TextIO | None = None, stdout: TextIO | None = None) -> int:
             result = _rpc_dispatch(
                 request.get("method", ""), request.get("params") or {}
             )
-            response: Dict[str, Any] = {
-                "id": request_id, "ok": True, "result": result
-            }
+            response: Dict[str, Any] = {"id": request_id, "ok": True, "result": result}
         except Exception as exc:  # surfaced to the caller, never fatal here
             response = {
                 "id": request_id,
@@ -615,23 +634,34 @@ def serve_rpc(stdin: TextIO | None = None, stdout: TextIO | None = None) -> int:
 def _add_arch_arguments(parser: argparse.ArgumentParser) -> None:
     group = parser.add_argument_group("hardware")
     group.add_argument(
-        "--arch", default="ascend910b",
+        "--arch",
+        default="ascend910b",
         help=f"built-in manifest ({', '.join(list_architectures())})",
     )
     group.add_argument(
-        "--arch-file", metavar="PATH",
-        help="JSON manifest; may use {\"base\": \"ascend910b\", ...} to patch",
+        "--arch-file",
+        metavar="PATH",
+        help='JSON manifest; may use {"base": "ascend910b", ...} to patch',
     )
     group.add_argument(
-        "--pipe-bw", action="append", type=_key_value, metavar="NAME=BYTES",
+        "--pipe-bw",
+        action="append",
+        type=_key_value,
+        metavar="NAME=BYTES",
         help="override a pipe bandwidth in B/cycle, e.g. --pipe-bw MTE1=512",
     )
     group.add_argument(
-        "--pipe-latency", action="append", type=_key_value,
-        metavar="NAME=CYCLES", help="override a pipe base latency",
+        "--pipe-latency",
+        action="append",
+        type=_key_value,
+        metavar="NAME=CYCLES",
+        help="override a pipe base latency",
     )
     group.add_argument(
-        "--pool-bytes", action="append", type=_key_value, metavar="NAME=BYTES",
+        "--pool-bytes",
+        action="append",
+        type=_key_value,
+        metavar="NAME=BYTES",
         help="override a pool capacity, e.g. --pool-bytes L1=1048576",
     )
     group.add_argument(
@@ -639,22 +669,30 @@ def _add_arch_arguments(parser: argparse.ArgumentParser) -> None:
     )
 
 
-def _add_problem_arguments(parser: argparse.ArgumentParser) -> None:
+def _add_problem_arguments(
+    parser: argparse.ArgumentParser, *, require_gemm: bool = True
+) -> None:
     group = parser.add_argument_group("problem")
     group.add_argument(
-        "--gemm", type=_int_triple, required=True, metavar="M,N,K",
+        "--gemm",
+        type=_int_triple,
+        required=require_gemm,
+        metavar="M,N,K",
         help="GEMM extents, e.g. --gemm 2048,2048,4096",
     )
     group.add_argument("--batch", type=int, default=1, help="batch count")
     group.add_argument(
-        "--dtype", default="fp16",
+        "--dtype",
+        default="fp16",
         help="input element type (fp16, bf16, int8, fp32, fp8)",
     )
     group.add_argument(
         "--out-dtype", default=None, help="output element type (default: input)"
     )
     group.add_argument(
-        "--cores", type=int, default=1,
+        "--cores",
+        type=int,
+        default=1,
         help="AI Cores the problem is split across; >1 models HBM contention",
     )
     group.add_argument("--transpose-a", action="store_true")
@@ -663,7 +701,8 @@ def _add_problem_arguments(parser: argparse.ArgumentParser) -> None:
     group.add_argument("--bias", action="store_true", help="bias epilogue")
     group.add_argument("--relu", action="store_true", help="ReLU epilogue")
     group.add_argument(
-        "--epilogue-on-vector", action="store_true",
+        "--epilogue-on-vector",
+        action="store_true",
         help="run the epilogue on the Vector unit via UB instead of Fixpipe",
     )
     group.add_argument("--name", default="flow", help="label for the report")
@@ -672,26 +711,36 @@ def _add_problem_arguments(parser: argparse.ArgumentParser) -> None:
 def _add_staging_arguments(parser: argparse.ArgumentParser) -> None:
     group = parser.add_argument_group("staging")
     group.add_argument(
-        "--buffers", default="double", choices=["single", "double", "triple"],
+        "--buffers",
+        default="double",
+        choices=["single", "double", "triple"],
         help="multi-buffering preset (default: double)",
     )
     for name in ("l1-depth", "l0-depth", "l0c-depth", "ub-depth"):
         group.add_argument(
-            f"--{name}", type=int, default=None,
+            f"--{name}",
+            type=int,
+            default=None,
             help=f"override {name.replace('-', '_')} from the preset",
         )
     group.add_argument(
-        "--loop-order", default="M_first", choices=["M_first", "N_first"],
+        "--loop-order",
+        default="M_first",
+        choices=["M_first", "N_first"],
         help="which spatial dimension carries the outermost tile loop",
     )
     group.add_argument(
-        "--stationary", choices=["m", "n"], default=None,
+        "--stationary",
+        choices=["m", "n"],
+        default=None,
         help="operand that stays resident across the inner spatial sweep: "
-             "m keeps the M-side operand (A) resident => M_first, n keeps B "
-             "resident => N_first; overrides --loop-order",
+        "m keeps the M-side operand (A) resident => M_first, n keeps B "
+        "resident => N_first; overrides --loop-order",
     )
     group.add_argument(
-        "--k-position", default="inner", choices=["inner", "outer"],
+        "--k-position",
+        default="inner",
+        choices=["inner", "outer"],
         help="inner keeps the accumulator in L0C; outer re-materialises C",
     )
 
@@ -699,32 +748,36 @@ def _add_staging_arguments(parser: argparse.ArgumentParser) -> None:
 def _add_output_arguments(parser: argparse.ArgumentParser) -> None:
     group = parser.add_argument_group("output")
     group.add_argument(
-        "--format", default="json", choices=["json", "text"],
+        "--format",
+        default="json",
+        choices=["json", "text"],
         help="json (default, for agents) or text (for humans)",
     )
+    group.add_argument("--compact", action="store_true", help="single-line JSON")
     group.add_argument(
-        "--compact", action="store_true", help="single-line JSON"
-    )
-    group.add_argument(
-        "--pretty", action="store_true",
+        "--pretty",
+        action="store_true",
         help="pretty-print JSON with indent=2 (the default; overrides --compact)",
     )
     group.add_argument(
         "-o", "--output", metavar="PATH", help="write to a file instead of stdout"
     )
     group.add_argument(
-        "--strict", action="store_true",
+        "--strict",
+        action="store_true",
         help=f"exit {EXIT_INFEASIBLE} when nothing feasible was found",
     )
     group.add_argument(
         "--no-l2", action="store_true", help="disable L2 reuse modelling"
     )
     group.add_argument(
-        "--no-hbm-contention", action="store_true",
+        "--no-hbm-contention",
+        action="store_true",
         help="ignore the per-core HBM share even when --cores > 1",
     )
     group.add_argument(
-        "--no-hints", action="store_true",
+        "--no-hints",
+        action="store_true",
         help="skip Ascend C code-generation hints",
     )
 
@@ -733,8 +786,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="npu-pipesim",
         description=(
-            "Analytical flow and tiling simulator for Huawei Ascend DaVinci "
-            "AI Cores."
+            "Analytical flow and tiling simulator for Huawei Ascend DaVinci AI Cores."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
@@ -752,16 +804,23 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
-    probe = sub.add_parser(
-        "probe", help="evaluate one explicit tiling configuration"
-    )
-    _add_problem_arguments(probe)
+    probe = sub.add_parser("probe", help="evaluate one explicit tiling configuration")
+    _add_problem_arguments(probe, require_gemm=False)
     probe.add_argument(
-        "--tile", type=_int_triple, metavar="M,N,K",
+        "--flow-file",
+        metavar="PATH",
+        help="JSON AlgorithmFlow, including vector_gemv and fused SIMT workloads",
+    )
+    probe.add_argument(
+        "--tile",
+        type=_int_triple,
+        metavar="M,N,K",
         help="outer L1 tile (default 128,128,64)",
     )
     probe.add_argument(
-        "--subtile", type=_int_triple, metavar="m,n,k",
+        "--subtile",
+        type=_int_triple,
+        metavar="m,n,k",
         help="inner L0 subtile (default: half the tile)",
     )
     _add_staging_arguments(probe)
@@ -776,31 +835,42 @@ def build_parser() -> argparse.ArgumentParser:
         "--max-tile", type=int, default=512, help="largest tile edge to try"
     )
     auto.add_argument(
-        "--max-evaluations", type=int, default=8000,
+        "--max-evaluations",
+        type=int,
+        default=8000,
         help="cap on full evaluations (pruned candidates are free)",
     )
     auto.add_argument(
-        "--time-budget", type=float, metavar="SECONDS",
+        "--time-budget",
+        type=float,
+        metavar="SECONDS",
         help="stop searching after this long and report what was found",
     )
     auto.add_argument(
-        "--forbid-tails", action="store_true",
+        "--forbid-tails",
+        action="store_true",
         help="only accept tiles that divide M, N and K exactly",
     )
     auto.add_argument(
-        "--include-infeasible", action="store_true",
+        "--include-infeasible",
+        action="store_true",
         help="keep candidates that violate a capacity constraint",
     )
     auto.add_argument(
-        "--loop-orders", nargs="+", choices=["M_first", "N_first"],
+        "--loop-orders",
+        nargs="+",
+        choices=["M_first", "N_first"],
         help="restrict the loop orders considered",
     )
     auto.add_argument(
-        "--buffer-plans", nargs="+", choices=["single", "double", "triple"],
+        "--buffer-plans",
+        nargs="+",
+        choices=["single", "double", "triple"],
         help="buffering presets to consider (default: double)",
     )
     auto.add_argument(
-        "--full-report", action="store_true",
+        "--full-report",
+        action="store_true",
         help="embed the complete evaluation report for every candidate",
     )
     auto.add_argument("--tile", type=_int_triple, help=argparse.SUPPRESS)
@@ -816,27 +886,34 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_problem_arguments(gen)
     gen.add_argument(
-        "--tile", type=_int_triple, metavar="M,N,K",
+        "--tile",
+        type=_int_triple,
+        metavar="M,N,K",
         help="outer L1 tile (default 128,128,64)",
     )
     gen.add_argument(
-        "--subtile", type=_int_triple, metavar="m,n,k",
+        "--subtile",
+        type=_int_triple,
+        metavar="m,n,k",
         help="inner L0 subtile (default: half the tile)",
     )
     _add_staging_arguments(gen)
     _add_arch_arguments(gen)
     _add_output_arguments(gen)
     gen.add_argument(
-        "--outdir", metavar="DIR",
+        "--outdir",
+        metavar="DIR",
         help="write kernel.cpp and kernel_tiling.h into DIR instead of "
-             "emitting the sources as JSON",
+        "emitting the sources as JSON",
     )
     gen.set_defaults(func=run_codegen)
 
     archs = sub.add_parser("archs", help="list or describe hardware manifests")
     archs.add_argument("name", nargs="?", help="manifest to describe in full")
     archs.add_argument(
-        "--format", default="text", choices=["json", "text"],
+        "--format",
+        default="text",
+        choices=["json", "text"],
     )
     archs.add_argument("--compact", action="store_true")
     archs.add_argument("-o", "--output", metavar="PATH")

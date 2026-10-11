@@ -7,9 +7,10 @@ Vector compute units.
 
 Design notes
 ------------
-The DaVinci core is a *spatial* accelerator: there is no hardware cache. Every
-byte consumed by the Cube engine must be explicitly staged by the programmer
-along the chain::
+The Cube path is a *spatial* accelerator: every byte it consumes must be
+explicitly staged by the programmer along the chain below. DaVinci v3 SIMT
+threads additionally access a DataCache; the arch35 SIMT profile models that
+cache separately from the explicit Cube and SIMD staging path::
 
     GM --MTE2--> L1 --MTE1--> L0A / L0B --Cube--> L0C --Fixpipe--> GM / UB
       \\                                                             ^
@@ -51,6 +52,7 @@ __all__ = [
     "FractalShape",
     "CubeDTypeProfile",
     "ComputeUnit",
+    "SimtHardware",
     "NpuArchitecture",
     "list_architectures",
     "get_architecture",
@@ -90,13 +92,26 @@ class DType(str, Enum):
 
     @property
     def is_float(self) -> bool:
-        return self in (DType.FP32, DType.FP16, DType.BF16, DType.FP8,
-                        DType.MXFP8, DType.HIF8, DType.MXFP4)
+        return self in (
+            DType.FP32,
+            DType.FP16,
+            DType.BF16,
+            DType.FP8,
+            DType.MXFP8,
+            DType.HIF8,
+            DType.MXFP4,
+        )
 
     @property
     def is_quantized(self) -> bool:
-        return self in (DType.INT8, DType.UINT8, DType.FP8,
-                        DType.MXFP8, DType.HIF8, DType.MXFP4)
+        return self in (
+            DType.INT8,
+            DType.UINT8,
+            DType.FP8,
+            DType.MXFP8,
+            DType.HIF8,
+            DType.MXFP4,
+        )
 
     @classmethod
     def parse(cls, value: "str | DType") -> "DType":
@@ -108,8 +123,7 @@ class DType(str, Enum):
             return cls(key)
         except ValueError as exc:
             raise ValueError(
-                f"unknown dtype {value!r}; expected one of "
-                f"{[d.value for d in cls]}"
+                f"unknown dtype {value!r}; expected one of {[d.value for d in cls]}"
             ) from exc
 
 
@@ -128,16 +142,29 @@ _DTYPE_SIZE: Dict[DType, float] = {
 }
 
 _DTYPE_ALIASES: Dict[str, str] = {
-    "float32": "fp32", "f32": "fp32", "float": "fp32",
-    "float16": "fp16", "f16": "fp16", "half": "fp16",
+    "float32": "fp32",
+    "f32": "fp32",
+    "float": "fp32",
+    "float16": "fp16",
+    "f16": "fp16",
+    "half": "fp16",
     "bfloat16": "bf16",
-    "float8": "fp8", "f8": "fp8", "e4m3": "fp8", "e5m2": "fp8",
-    "microscalingfp8": "mxfp8", "mx8": "mxfp8",
-    "huaweifp8": "hif8", "hi8": "hif8",
-    "microscalingfp4": "mxfp4", "mx4": "mxfp4",
-    "i32": "int32", "s32": "int32",
-    "i16": "int16", "s16": "int16",
-    "i8": "int8", "s8": "int8",
+    "float8": "fp8",
+    "f8": "fp8",
+    "e4m3": "fp8",
+    "e5m2": "fp8",
+    "microscalingfp8": "mxfp8",
+    "mx8": "mxfp8",
+    "huaweifp8": "hif8",
+    "hi8": "hif8",
+    "microscalingfp4": "mxfp4",
+    "mx4": "mxfp4",
+    "i32": "int32",
+    "s32": "int32",
+    "i16": "int16",
+    "s16": "int16",
+    "i8": "int8",
+    "s8": "int8",
     "u8": "uint8",
 }
 
@@ -145,13 +172,13 @@ _DTYPE_ALIASES: Dict[str, str] = {
 class PipeKind(str, Enum):
     """The named hardware queues an Ascend C kernel synchronises against."""
 
-    MTE1 = "MTE1"          # L1 -> L0A/L0B (fractal load, LoadData)
-    MTE2 = "MTE2"          # GM -> L1 / UB (DataCopy, Nd2Nz)
-    MTE3 = "MTE3"          # UB -> GM (DataCopy)
-    FIXPIPE = "FIXPIPE"    # L0C -> GM / UB (Fixpipe; quant/dequant/ReLU)
-    CUBE = "CUBE"          # L0A x L0B -> L0C (Mmad)
-    VECTOR = "VECTOR"      # UB -> UB (Add, Mul, Cast, ...)
-    SCALAR = "SCALAR"      # address / loop bookkeeping
+    MTE1 = "MTE1"  # L1 -> L0A/L0B (fractal load, LoadData)
+    MTE2 = "MTE2"  # GM -> L1 / UB (DataCopy, Nd2Nz)
+    MTE3 = "MTE3"  # UB -> GM (DataCopy)
+    FIXPIPE = "FIXPIPE"  # L0C -> GM / UB (Fixpipe; quant/dequant/ReLU)
+    CUBE = "CUBE"  # L0A x L0B -> L0C (Mmad)
+    VECTOR = "VECTOR"  # UB -> UB (Add, Mul, Cast, ...)
+    SCALAR = "SCALAR"  # address / loop bookkeeping
 
 
 # ---------------------------------------------------------------------------
@@ -386,6 +413,38 @@ class ComputeUnit:
 
 
 @dataclass(frozen=True)
+class SimtHardware:
+    """SIMT scheduling and cache assumptions for one Vector core."""
+
+    warp_size: int = 32
+    warp_schedulers: int = 4
+    datacache_bytes: int = 32 * KiB
+    cache_line_bytes: int = 128
+    cache_hit_cycles: float = 8.0
+    l2_fill_cycles: float = 80.0
+    hbm_fill_cycles: float = 200.0
+    outstanding_fills_per_scheduler: int = 8
+    ub_shared_bandwidth_bpc: float = 512.0
+    register_file_bytes: int = 128 * KiB
+    max_threads_per_core: int = 2048
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "warp_size": self.warp_size,
+            "warp_schedulers": self.warp_schedulers,
+            "datacache_bytes": self.datacache_bytes,
+            "cache_line_bytes": self.cache_line_bytes,
+            "cache_hit_cycles": self.cache_hit_cycles,
+            "l2_fill_cycles": self.l2_fill_cycles,
+            "hbm_fill_cycles": self.hbm_fill_cycles,
+            "outstanding_fills_per_scheduler": self.outstanding_fills_per_scheduler,
+            "ub_shared_bandwidth_bpc": self.ub_shared_bandwidth_bpc,
+            "register_file_bytes": self.register_file_bytes,
+            "max_threads_per_core": self.max_threads_per_core,
+        }
+
+
+@dataclass(frozen=True)
 class NpuArchitecture:
     """A complete analytical manifest for one AI Core plus its die context."""
 
@@ -403,6 +462,7 @@ class NpuArchitecture:
     #: False on fused Cube+Vector cores, where a Vector epilogue blocks Cube.
     decoupled_vector_core: bool = True
     notes: str = ""
+    simt: "SimtHardware | None" = None
 
     # -- lookups ----------------------------------------------------------
     def pool(self, name: str) -> MemoryPool:
@@ -438,8 +498,11 @@ class NpuArchitecture:
         """HBM bytes/cycle available to one core when every core streams."""
         if self.cube_cores <= 0:
             return 0.0
-        total_bpc = self.hbm_bandwidth_gbps * 1e9 / (self.frequency_ghz * 1e9)
-        return total_bpc / self.cube_cores
+        return self.hbm_bandwidth_bpc_total() / self.cube_cores
+
+    def hbm_bandwidth_bpc_total(self) -> float:
+        """Aggregate package HBM bandwidth, bytes per core clock cycle."""
+        return self.hbm_bandwidth_gbps / self.frequency_ghz
 
     def cycles_to_us(self, cycles: float) -> float:
         return cycles / (self.frequency_ghz * 1e3)
@@ -474,6 +537,7 @@ class NpuArchitecture:
             "cube": self.cube.to_dict(),
             "vector": self.vector.to_dict(),
             "notes": self.notes,
+            "simt": self.simt.to_dict() if self.simt else None,
         }
 
 
@@ -556,33 +620,58 @@ def _standard_pipes(
     """The canonical DaVinci transfer-engine set."""
     return {
         "MTE2": PipeChannel(
-            "MTE2", PipeKind.MTE2, "GM", "L1",
-            bandwidth_bpc=mte2_bpc, base_latency_cycles=mte2_latency,
-            max_outstanding=8, min_burst_bytes=512,
+            "MTE2",
+            PipeKind.MTE2,
+            "GM",
+            "L1",
+            bandwidth_bpc=mte2_bpc,
+            base_latency_cycles=mte2_latency,
+            max_outstanding=8,
+            min_burst_bytes=512,
             description="GM -> L1 load, optional ND->NZ reformat.",
         ),
         "MTE2_UB": PipeChannel(
-            "MTE2_UB", PipeKind.MTE2, "GM", "UB",
-            bandwidth_bpc=mte2_bpc, base_latency_cycles=mte2_latency,
-            max_outstanding=8, min_burst_bytes=512,
+            "MTE2_UB",
+            PipeKind.MTE2,
+            "GM",
+            "UB",
+            bandwidth_bpc=mte2_bpc,
+            base_latency_cycles=mte2_latency,
+            max_outstanding=8,
+            min_burst_bytes=512,
             description="GM -> UB load for Vector-side operands.",
         ),
         "MTE1": PipeChannel(
-            "MTE1", PipeKind.MTE1, "L1", "L0A",
-            bandwidth_bpc=mte1_bpc, base_latency_cycles=mte1_latency,
-            max_outstanding=4, min_burst_bytes=32,
+            "MTE1",
+            PipeKind.MTE1,
+            "L1",
+            "L0A",
+            bandwidth_bpc=mte1_bpc,
+            base_latency_cycles=mte1_latency,
+            max_outstanding=4,
+            min_burst_bytes=32,
             description="L1 -> L0A/L0B fractal load (LoadData2d/3d).",
         ),
         "FIXPIPE": PipeChannel(
-            "FIXPIPE", PipeKind.FIXPIPE, "L0C", "GM",
-            bandwidth_bpc=fixpipe_bpc, base_latency_cycles=fixpipe_latency,
-            max_outstanding=4, min_burst_bytes=32,
+            "FIXPIPE",
+            PipeKind.FIXPIPE,
+            "L0C",
+            "GM",
+            bandwidth_bpc=fixpipe_bpc,
+            base_latency_cycles=fixpipe_latency,
+            max_outstanding=4,
+            min_burst_bytes=32,
             description="L0C -> GM/UB drain with inline quant/dequant/ReLU.",
         ),
         "MTE3": PipeChannel(
-            "MTE3", PipeKind.MTE3, "UB", "GM",
-            bandwidth_bpc=mte3_bpc, base_latency_cycles=mte3_latency,
-            max_outstanding=4, min_burst_bytes=512,
+            "MTE3",
+            PipeKind.MTE3,
+            "UB",
+            "GM",
+            bandwidth_bpc=mte3_bpc,
+            base_latency_cycles=mte3_latency,
+            max_outstanding=4,
+            min_burst_bytes=512,
             description="UB -> GM store.",
         ),
     }
@@ -609,23 +698,27 @@ def _cube_unit(
             DType.BF16, k0=16, macs_per_cycle=base_macs_per_cycle
         ),
         DType.INT8.value: CubeDTypeProfile(
-            DType.INT8, k0=32,
+            DType.INT8,
+            k0=32,
             macs_per_cycle=int(base_macs_per_cycle * int8_speedup),
             accumulator=DType.INT32,
         ),
         DType.UINT8.value: CubeDTypeProfile(
-            DType.UINT8, k0=32,
+            DType.UINT8,
+            k0=32,
             macs_per_cycle=int(base_macs_per_cycle * int8_speedup),
             accumulator=DType.INT32,
         ),
         DType.FP32.value: CubeDTypeProfile(
-            DType.FP32, k0=8,
+            DType.FP32,
+            k0=8,
             macs_per_cycle=int(base_macs_per_cycle / fp32_slowdown),
         ),
     }
     if fp8:
         profiles[DType.FP8.value] = CubeDTypeProfile(
-            DType.FP8, k0=32,
+            DType.FP8,
+            k0=32,
             macs_per_cycle=int(base_macs_per_cycle * int8_speedup),
         )
     return ComputeUnit(
@@ -719,8 +812,11 @@ def _ascend351x() -> NpuArchitecture:
         vector_cores=64,
         pools=_standard_pools(l1_bytes=1 * MiB, ub_bytes=256 * KiB),
         pipes=_standard_pipes(
-            mte2_bpc=128.0, mte2_latency=160.0,
-            mte1_bpc=128.0, fixpipe_bpc=128.0, mte3_bpc=128.0,
+            mte2_bpc=128.0,
+            mte2_latency=160.0,
+            mte1_bpc=128.0,
+            fixpipe_bpc=128.0,
+            mte3_bpc=128.0,
         ),
         cube=_cube_unit(base_macs_per_cycle=8192, fp8=True),
         vector=_vector_unit(bytes_per_cycle=512.0),
@@ -736,32 +832,48 @@ def _ascend351x() -> NpuArchitecture:
 
 def _ascend950pr() -> NpuArchitecture:
     """Default 32 Cube / 64 Vector 950PR bin from the 2026 whitepaper."""
-    pools = _standard_pools(l1_bytes=512 * KiB, ub_bytes=512 * KiB,
-                            l0c_bytes=256 * KiB)
+    pools = _standard_pools(l1_bytes=512 * KiB, ub_bytes=216 * KiB, l0c_bytes=256 * KiB)
+    pools["UB"] = replace(
+        pools["UB"],
+        description="950PR AIV: 256 KiB physical UB, 216 KiB tensor budget "
+        "after 8 KiB compiler reserve and 32 KiB SIMT DataCache.",
+    )
     pools["GM"] = replace(
-        pools["GM"], capacity_bytes=128 * 1024 * MiB,
+        pools["GM"],
+        capacity_bytes=128 * 1024 * MiB,
         description="Package-attached high-speed memory in a two-AI-Die UMA space.",
     )
     cube = _cube_unit(base_macs_per_cycle=4096, fp8=True)
     profiles = dict(cube.dtype_profiles)
     for dtype, k0, macs in (
-        (DType.MXFP8, 32, 8192), (DType.HIF8, 32, 8192),
+        (DType.MXFP8, 32, 8192),
+        (DType.HIF8, 32, 8192),
         (DType.MXFP4, 64, 16384),
     ):
-        profiles[dtype.value] = CubeDTypeProfile(dtype, k0=k0,
-                                                 macs_per_cycle=macs)
+        profiles[dtype.value] = CubeDTypeProfile(dtype, k0=k0, macs_per_cycle=macs)
     return NpuArchitecture(
-        name="ascend950pr", family="DaVinci v3 (Ascend 950PR)",
+        name="ascend950pr",
+        family="DaVinci v3 (Ascend 950PR)",
         # Approximation inferred from 432 TFLOP/s Cube FP16 / 32 cores.
-        frequency_ghz=1.65, cube_cores=32, vector_cores=64,
+        frequency_ghz=1.65,
+        cube_cores=32,
+        vector_cores=64,
         pools=pools,
-        pipes=_standard_pipes(mte2_bpc=128.0, mte1_bpc=128.0,
-                              fixpipe_bpc=128.0, mte3_bpc=128.0),
+        pipes=_standard_pipes(
+            mte2_bpc=128.0,
+            mte1_bpc=128.0,
+            fixpipe_bpc=128.0,
+            mte3_bpc=128.0,
+            mte2_latency=200.0,
+        ),
         cube=replace(cube, dtype_profiles=profiles),
         vector=_vector_unit(bytes_per_cycle=512.0),
-        hbm_bandwidth_gbps=1600.0, l2_capacity_bytes=128 * MiB,
-        notes="950PR default bin; 28/56, 112 GB and 112 MB L2 variants also exist. "
-              "Frequency and local DMA rates are analytical estimates.",
+        hbm_bandwidth_gbps=1600.0,
+        l2_capacity_bytes=128 * MiB,
+        simt=SimtHardware(),
+        notes="950PR arch35 AIV tensor ceiling is 216 KiB of 256 KiB physical UB. "
+        "The 28/56, 112 GB and 112 MB L2 variants also exist. "
+        "Frequency and local DMA rates are analytical estimates.",
     )
 
 
@@ -769,13 +881,23 @@ def _ascend950dt() -> NpuArchitecture:
     """Default full 36 Cube / 72 Vector 950DT bin."""
     pr = _ascend950pr()
     return pr.evolve(
-        name="ascend950dt", family="DaVinci v3 (Ascend 950DT)",
-        cube_cores=36, vector_cores=72,
-        pools={**pr.pools, "GM": replace(pr.pool("GM"),
-                                         capacity_bytes=144 * 1024 * MiB)},
+        name="ascend950dt",
+        family="DaVinci v3 (Ascend 950DT)",
+        cube_cores=36,
+        vector_cores=72,
+        pools={
+            **pr.pools,
+            "UB": replace(
+                pr.pool("UB"),
+                capacity_bytes=512 * KiB,
+                description="Aggregate UB capacity for the "
+                "950DT analytical Cube/Vector model.",
+            ),
+            "GM": replace(pr.pool("GM"), capacity_bytes=144 * 1024 * MiB),
+        },
         hbm_bandwidth_gbps=4000.0,
         notes="950DT default bin; 32/64 and 28/56 variants also exist. "
-              "Frequency and local DMA rates are analytical estimates.",
+        "Frequency and local DMA rates are analytical estimates.",
     )
 
 
@@ -797,6 +919,8 @@ _ALIASES: Dict[str, str] = {
     "910c": "ascend910c",
     "351x": "ascend351x",
     "950pr": "ascend950pr",
+    "arch35": "ascend950pr",
+    "dav3510": "ascend950pr",
     "950dt": "ascend950dt",
     "ascend950": "ascend950dt",
     "default": "ascend910b",
@@ -840,20 +964,28 @@ def architecture_from_dict(data: Mapping[str, Any]) -> NpuArchitecture:
     if base_name is not None:
         arch = get_architecture(base_name)
         scalar_keys = (
-            "name", "family", "frequency_ghz", "cube_cores", "vector_cores",
-            "hbm_bandwidth_gbps", "l2_capacity_bytes", "decoupled_vector_core",
+            "name",
+            "family",
+            "frequency_ghz",
+            "cube_cores",
+            "vector_cores",
+            "hbm_bandwidth_gbps",
+            "l2_capacity_bytes",
+            "decoupled_vector_core",
             "notes",
         )
         patch = {k: data[k] for k in scalar_keys if k in data}
         if patch:
             arch = arch.evolve(**patch)
+        if "simt" in data:
+            arch = arch.evolve(
+                simt=SimtHardware(**data["simt"]) if data["simt"] else None
+            )
         for pool_name, changes in (data.get("pools") or {}).items():
             changes = {k: v for k, v in changes.items() if k != "name"}
             arch = arch.with_pool_override(pool_name, **changes)
         for pipe_name, changes in (data.get("pipes") or {}).items():
-            changes = {
-                k: v for k, v in changes.items() if k not in ("name", "kind")
-            }
+            changes = {k: v for k, v in changes.items() if k not in ("name", "kind")}
             arch = arch.with_pipe_override(pipe_name, **changes)
         return arch
 
@@ -877,6 +1009,7 @@ def architecture_from_dict(data: Mapping[str, Any]) -> NpuArchitecture:
         l2_capacity_bytes=int(data.get("l2_capacity_bytes", 0)),
         decoupled_vector_core=bool(data.get("decoupled_vector_core", True)),
         notes=data.get("notes", ""),
+        simt=SimtHardware(**data["simt"]) if data.get("simt") else None,
     )
 
 
