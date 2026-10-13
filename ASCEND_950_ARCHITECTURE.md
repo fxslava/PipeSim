@@ -56,9 +56,11 @@ Vector issue work and UB-port traffic.
 
 Hybrid VF dispatch accounting: every `asc_vf_call` boundary reconfigures the
 physically shared Vector ALU between SIMD and SIMT warp issue.
-`SimtHardware.vf_mode_switch_penalty_cycles` (default 64, validated inside
-the measured 30..80-cycle window) prices each boundary, and
-`SimtWorkload.vf_dispatches_per_phase` counts them per outer tile, so a
+`SimtHardware.vf_mode_switch_penalty_cycles` (default 64) prices each boundary
+as a configurable analytical assumption. The low-level AIV skill audit does
+not establish a numeric timing guarantee, so PipeSim does not constrain the
+override to a presumed 30..80-cycle hardware range; calibrate it on the
+target CANN build. `SimtWorkload.vf_dispatches_per_phase` counts boundaries per outer tile, so a
 per-row dispatch GEMV carries `rows x 64` cycles inside the VECTOR stage.
 `SimtWorkload.shuffle_ops_per_thread` models warp butterfly shuffles
 (`asc_shfl_xor`) as register-resident reductions - shared-ALU issue cycles
@@ -90,6 +92,13 @@ These **per-cycle** rows preserve the whitepaper's relative ratios and the simul
 **BufferID:** the whitepaper describes `get_buf(pipe, #id)` as acquisition and `rel_buf(pipe, #id)` as release, with buffer ownership replacing explicit `set_flag`/`wait_flag` pair management (section 4.1.6). This is a **semantic notation from the paper**, not a verified Ascend C header signature. Bind it to the target CANN version, preserve one acquire/release per live buffer, and ensure neither Cube nor Vector overwrites data still consumed by the other. PipeSim codegen can emit a gated BufferID branch while retaining a legacy flag branch for builds without that API.
 
 The 950 JSON profiles use **128 B/cycle** for MTE1/MTE2/MTE3/FIXPIPE, NDDMA, and CV bypass as an **analytical service-rate assumption requested for v3 modeling**. The whitepaper specifies 128 B NDDMA read coalescing, not 128 B/cycle throughput. Calibrate these channel rates and startup latencies against measured kernels before using absolute time predictions.
+
+The 950 profiles also retain the UMA L2 organization (512 B lines, four
+128 B sectors). PipeSim uses the 128 B sector size when estimating partial
+HBM fills for data that spills beyond the modeled L2 capacity; GM alignment
+checks remain 512 B. The single-expert pilot's packed weights and scales fit
+within L2, but its reported cold-stream latency does not assume a warm-cache
+hit across separate operator invocations.
 
 ## Interconnect and collectives
 

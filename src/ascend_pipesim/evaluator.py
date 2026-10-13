@@ -41,10 +41,12 @@ from typing import Any, Dict, List, Mapping, Sequence, Tuple
 
 from .dsl import (
     AlgorithmFlow,
+    BufferLifetime,
     ExecutionMode,
     KPosition,
     LoopOrder,
     OpType,
+    OutputPath,
 )
 from .topology import NpuArchitecture, get_architecture
 
@@ -836,9 +838,24 @@ def _tier1_footprints(
             else 1
         )
         effective_depth = max(plan.ub_depth, ring_depth)
-        ub_bytes += out_tile * effective_depth
-        for op in flow.vector_epilogue_ops():
-            if op.operand is not None:
+        if flow.ub_lifetimes:
+            ub_bytes, effective_depth, ub_breakdown = _ub_liveness_peak(
+                ub, flow.ub_lifetimes
+            )
+        else:
+            ops = flow.vector_epilogue_ops()
+            lives = [
+                BufferLifetime(
+                    "C_tile",
+                    out_tile,
+                    0,
+                    len(ops),
+                    effective_depth,
+                )
+            ]
+            for idx, op in enumerate(ops):
+                if op.operand is None:
+                    continue
                 shape = op.operand.shape
                 if graph.mode in (ExecutionMode.MIX_SPLIT_M, ExecutionMode.MIX_SPLIT_N):
                     if len(shape) >= 2 and shape[-2:] in (
@@ -854,9 +871,15 @@ def _tier1_footprints(
                         local_elements = op.operand.num_elements
                 else:
                     local_elements = op.operand.num_elements
-                operand_bytes = ub.aligned_size(local_elements * op.operand.itemsize)
-                ub_breakdown[op.operand.name] = operand_bytes
-                ub_bytes += operand_bytes
+                lives.append(
+                    BufferLifetime(
+                        op.operand.name,
+                        ub.aligned_size(local_elements * op.operand.itemsize),
+                        idx + 1,
+                        idx + 1,
+                    )
+                )
+            ub_bytes, effective_depth, ub_breakdown = _ub_liveness_peak(ub, lives)
     footprints["UB"] = SramFootprint(
         "UB",
         ub_bytes,
@@ -916,33 +939,102 @@ def _tier1_footprints_elemwise(
     plan = flow.buffers
     tile_elems = flow.tile.tile_m
     n_in = flow.elemwise_inputs
+    if flow.ub_lifetimes:
+        total, depth, breakdown = _ub_liveness_peak(ub, flow.ub_lifetimes)
+        fp = SramFootprint("UB", total, ub.capacity_bytes, depth, breakdown)
+        return {"UB": fp}, _ub_capacity_violations(fp)
+
     if flow.op_type is OpType.VECTOR_GEMV:
-        in_bytes = ub.aligned_size(
+        weight_bytes = (
             tile_elems * flow.loops.k * itemsize
-        ) + ub.aligned_size(flow.loops.k * itemsize)
+            + tile_elems
+            * _ceil_div(flow.loops.k, flow.weight_scale_group_size)
+            * flow.weight_scale_bytes_per_group
+        )
+        weight_stage = ub.aligned_size(weight_bytes) * plan.ub_depth
+        input_resident = ub.aligned_size(flow.loops.k * flow.b.itemsize)
+        output_accumulator = ub.aligned_size(tile_elems * out_itemsize)
+        total = weight_stage + input_resident + output_accumulator
+        breakdown = {
+            "weight_stream_buffers": weight_stage,
+            "resident_input": input_resident,
+            "output_accumulator": output_accumulator,
+        }
     else:
         in_bytes = ub.aligned_size(tile_elems * itemsize) * n_in
-    out_bytes = ub.aligned_size(tile_elems * out_itemsize)
-    total = (in_bytes + out_bytes) * plan.ub_depth
+        out_bytes = ub.aligned_size(tile_elems * out_itemsize)
+        total = (in_bytes + out_bytes) * plan.ub_depth
+        breakdown = {"inputs": in_bytes, "output": out_bytes}
     fp = SramFootprint(
         "UB",
         total,
         ub.capacity_bytes,
-        plan.ub_depth,
-        {"inputs": in_bytes, "output": out_bytes},
+        plan.ub_depth if flow.op_type is OpType.VECTOR_GEMV else plan.ub_depth,
+        breakdown,
     )
-    violations: List[Violation] = []
-    if not fp.fits:
-        violations.append(
-            Violation(
-                "UB_OVERFLOW",
-                Severity.ERROR,
-                f"UB needs {total} B at depth {plan.ub_depth} but only "
-                f"{ub.capacity_bytes} B exist",
-                {"required_bytes": total, "capacity_bytes": ub.capacity_bytes},
-            )
+    return {"UB": fp}, _ub_capacity_violations(fp)
+
+
+def _ub_liveness_peak(
+    pool: Any, lifetimes: Sequence[BufferLifetime]
+) -> tuple[int, int, Dict[str, int]]:
+    """Pack non-overlapping UB lifetimes and collapse explicit in-place aliases."""
+    by_name = {life.name: life for life in lifetimes}
+
+    def root(name: str) -> str:
+        seen: set[str] = set()
+        while by_name[name].alias_of:
+            if name in seen:
+                raise ValueError("cyclic UB lifetime aliases")
+            seen.add(name)
+            name = by_name[name].alias_of  # validated by AlgorithmFlow
+        return name
+
+    points = sorted({life.first_stage for life in lifetimes})
+    max_bytes = 0
+    max_stage = points[0] if points else 0
+    max_breakdown: Dict[str, int] = {}
+    max_depth = 1
+    for stage in points:
+        live: Dict[str, tuple[int, int, list[str]]] = {}
+        for life in lifetimes:
+            if life.first_stage <= stage <= life.last_stage:
+                key = root(life.name)
+                size = pool.aligned_size(life.size_bytes)
+                prior_size, prior_depth, names = live.get(key, (0, 1, []))
+                live[key] = (
+                    max(prior_size, size),
+                    max(prior_depth, life.depth),
+                    names + [life.name],
+                )
+        breakdown = {
+            "/".join(names): size
+            for size, depth, names in live.values()
+        }
+        used = sum(size * depth for size, depth, _ in live.values())
+        if used > max_bytes:
+            max_bytes, max_stage, max_breakdown = used, stage, breakdown
+            max_depth = max((depth for _, depth, _ in live.values()), default=1)
+    max_breakdown[f"peak_at_stage_{max_stage}"] = max_bytes
+    return max_bytes, max_depth, max_breakdown
+
+
+def _ub_capacity_violations(fp: SramFootprint) -> List[Violation]:
+    if fp.fits:
+        return []
+    return [
+        Violation(
+            "UB_OVERFLOW",
+            Severity.ERROR,
+            f"UB needs {fp.bytes_used} B at depth {fp.depth} but only "
+            f"{fp.capacity_bytes} B exist",
+            {
+                "required_bytes": fp.bytes_used,
+                "capacity_bytes": fp.capacity_bytes,
+                "breakdown": fp.breakdown,
+            },
         )
-    return {"UB": fp}, violations
+    ]
 
 
 def _alignment_violations(
@@ -1142,7 +1234,7 @@ def _dram_bytes(
     b = traffic["mte2_b_bytes"]
 
     l2 = arch.l2_capacity_bytes if options.model_l2_reuse else 0
-    burst = arch.pool("GM").alignment_bytes
+    burst = arch.l2_sector_bytes or arch.pool("GM").alignment_bytes
     t = flow.tile
     a_run = (t.tile_m if flow.transpose_a else t.tile_k) * itemsize
     b_run = (t.tile_k if flow.transpose_b else t.tile_n) * itemsize
@@ -1188,6 +1280,12 @@ def _tier2_roofline(
     add("GM_MTE2", traffic["mte2_bytes"], mte2_bpc)
     add("L1_MTE1", mte1_bytes, arch.pipe("MTE1").bandwidth_bpc)
     add("L0C_FIXPIPE", fixpipe_bytes, arch.pipe("FIXPIPE").bandwidth_bpc)
+    if flow.output_path is OutputPath.CV_BYPASS_UB_MTE3:
+        add(
+            "CV_BYPASS",
+            traffic["cv_bypass_bytes"],
+            arch.pipe("CV_BYPASS").bandwidth_bpc,
+        )
     if options.model_hbm_contention and flow.cores > 1:
         share = arch.hbm_bandwidth_gbps * 1e9 / (arch.frequency_ghz * 1e9)
         add("DRAM", dram_bytes, share / flow.cores)
@@ -1219,6 +1317,7 @@ _STAGE_TO_BOTTLENECK = {
     "MTE1": "MTE1_BOUND",
     "CUBE": "CUBE_COMPUTE_BOUND",
     "FIXPIPE": "FIXPIPE_BACKPRESSURE",
+    "CV_BYPASS": "CV_BYPASS_BOUND",
     "VECTOR": "VECTOR_BOUND",
     "MTE3": "MTE3_BOUND",
     "IPC": "CROSS_CORE_SYNC_BOUND",
@@ -1249,6 +1348,7 @@ def _tier3_schedule(
     steps = max(1, work.steps)
     cube = arch.cube
     graph = flow.execution_graph
+    uses_cv_bypass = flow.output_path is OutputPath.CV_BYPASS_UB_MTE3
     if graph.mode is ExecutionMode.MIX_SPLIT_M:
         vector_share = _pad(
             _ceil_div(flow.tile.tile_m, graph.vector_consumers), 16
@@ -1296,14 +1396,30 @@ def _tier3_schedule(
             True,
             1,
         ),
-        PipelineStage(
-            "FIXPIPE",
-            _safe_div(fixpipe_bytes, steps * arch.pipe("FIXPIPE").bandwidth_bpc),
-            fixpipe_bytes,
-            plan.l0c_depth >= 2 or flow.k_position is KPosition.INNER,
-            plan.l0c_depth,
-        ),
     ]
+    if flow.output_path is OutputPath.CV_BYPASS_UB_MTE3:
+        stages.append(
+            PipelineStage(
+                "CV_BYPASS",
+                _safe_div(
+                    traffic["cv_bypass_bytes"],
+                    steps * arch.pipe("CV_BYPASS").bandwidth_bpc,
+                ),
+                traffic["cv_bypass_bytes"],
+                plan.l0c_depth >= 2 or flow.k_position is KPosition.INNER,
+                plan.l0c_depth,
+            )
+        )
+    else:
+        stages.append(
+            PipelineStage(
+                "FIXPIPE",
+                _safe_div(fixpipe_bytes, steps * arch.pipe("FIXPIPE").bandwidth_bpc),
+                fixpipe_bytes,
+                plan.l0c_depth >= 2 or flow.k_position is KPosition.INNER,
+                plan.l0c_depth,
+            )
+        )
     if flow.uses_unified_buffer or simt is not None:
         vector_overlapped = arch.decoupled_vector_core and plan.ub_depth >= 2
         stages.append(
@@ -1399,7 +1515,8 @@ def _tier3_schedule(
         fill += simt.cache_latency_cycles
     if mix:
         fill += sync_cycles  # first producer-ready handoff
-    drain = arch.pipe("FIXPIPE").base_latency_cycles
+    drain_pipe = "CV_BYPASS" if uses_cv_bypass else "FIXPIPE"
+    drain = arch.pipe(drain_pipe).base_latency_cycles
     if mix:
         drain += sync_cycles  # last consumer-credit return
     if flow.uses_unified_buffer:
@@ -1414,7 +1531,7 @@ def _tier3_schedule(
         arch.pipe("MTE2").base_latency_cycles
         + arch.pipe("MTE1").base_latency_cycles
         + cube.pipeline_latency_cycles
-        + arch.pipe("FIXPIPE").base_latency_cycles
+        + arch.pipe(drain_pipe).base_latency_cycles
         + (arch.pipe("MTE3").base_latency_cycles if flow.uses_unified_buffer else 0.0)
     )
     serialized_total = max(serialized_total, total)
@@ -1816,7 +1933,18 @@ def _evaluate_elemwise(
         flow, arch, itemsize, out_itemsize
     )
     if flow.op_type is OpType.VECTOR_GEMV:
-        in_bytes = float((elements + steps) * flow.loops.k * itemsize)
+        weight_bytes = (
+            elements * flow.loops.k * itemsize
+            + elements
+            * _ceil_div(flow.loops.k, flow.weight_scale_group_size)
+            * flow.weight_scale_bytes_per_group
+        )
+        input_bytes = (
+            0.0
+            if flow.input_preloaded
+            else flow.loops.k * flow.b.itemsize
+        )
+        in_bytes = float(weight_bytes + input_bytes)
     else:
         in_bytes = float(elements * itemsize * n_in)
     out_bytes = float(elements * out_itemsize)
@@ -1828,7 +1956,18 @@ def _evaluate_elemwise(
     )
     ops_per_elem = sum(op.ops_per_element for op in flow.epilogue) or 1.0
     if flow.op_type is OpType.VECTOR_GEMV:
-        vector_bytes = float(2 * elements * flow.loops.k * itemsize)
+        vector_bytes = float(
+            2
+            * (
+                elements * flow.loops.k * itemsize
+                + elements
+                * flow.loops.k
+                * flow.b.itemsize
+                + elements
+                * _ceil_div(flow.loops.k, flow.weight_scale_group_size)
+                * flow.weight_scale_bytes_per_group
+            )
+        )
         total_flops = int(2 * elements * flow.loops.k)
     else:
         vector_bytes = (in_bytes + out_bytes) * ops_per_elem
@@ -1839,12 +1978,18 @@ def _evaluate_elemwise(
         simt.vector_alu_cycles + simt.vf_mode_switch_cycles if simt else 0.0
     )
 
+    mte2_bpc = arch.pipe("MTE2_UB").bandwidth_bpc
+    if options.model_hbm_contention and flow.cores > 1:
+        mte2_bpc = min(
+            mte2_bpc,
+            arch.hbm_bandwidth_bpc_total() / flow.cores,
+        )
     stages = (
         PipelineStage(
             "MTE2",
             _safe_div(
                 in_bytes + simt_fill + simt_staged,
-                steps * arch.pipe("MTE2_UB").bandwidth_bpc,
+                steps * mte2_bpc,
             ),
             in_bytes + simt_fill + simt_staged,
             plan.ub_depth >= 2,
@@ -1914,7 +2059,11 @@ def _evaluate_elemwise(
         limiting_stage=(
             "UB_PORT_CONTENTION"
             if ub_port > ranked[0].cycles_per_step
-            else _STAGE_TO_BOTTLENECK.get(ranked[0].name, ranked[0].name)
+            else {
+                "MTE2": "MTE2_BANDWIDTH_BOUND",
+                "VECTOR": "VECTOR_BOUND",
+                "MTE3": "MTE3_BOUND",
+            }.get(ranked[0].name, ranked[0].name)
         ),
         secondary_stage=ranked[1].name,
         slack_pct=100.0
@@ -1931,8 +2080,8 @@ def _evaluate_elemwise(
                 "GM_MTE2",
                 moved,
                 _safe_div(total_flops, moved),
-                arch.pipe("MTE2_UB").bandwidth_bpc,
-                _safe_div(total_flops, moved) * arch.pipe("MTE2_UB").bandwidth_bpc,
+                mte2_bpc,
+                _safe_div(total_flops, moved) * mte2_bpc,
             ),
         ),
         binding_level="GM_MTE2",
@@ -2023,6 +2172,13 @@ def evaluate(
     """
     arch = get_architecture(arch)
     options = options or EvalOptions()
+    if (
+        flow.output_path is OutputPath.CV_BYPASS_UB_MTE3
+        and "CV_BYPASS" not in arch.pipes
+    ):
+        raise ValueError(
+            f"{arch.name} does not model the DaVinci v3 CV_BYPASS pathway"
+        )
     simt = _estimate_simt(flow, arch, options.simt_cache_miss_rate_drift)
 
     if flow.op_type in (OpType.ELEMWISE, OpType.VECTOR_GEMV):
@@ -2074,8 +2230,12 @@ def evaluate(
     out_elements = _safe_div(traffic["fixpipe_out_bytes"], max(1, out_itemsize))
     if flow.k_position is KPosition.OUTER:
         out_elements = _safe_div(traffic["fixpipe_out_bytes"], 4)
-    fixpipe_bytes = out_elements * max(4, out_itemsize)
+    output_handoff_bytes = out_elements * max(4, out_itemsize)
+    uses_cv_bypass = flow.output_path is OutputPath.CV_BYPASS_UB_MTE3
+    fixpipe_bytes = 0.0 if uses_cv_bypass else output_handoff_bytes
+    cv_bypass_bytes = output_handoff_bytes if uses_cv_bypass else 0.0
     traffic["fixpipe_bytes"] = fixpipe_bytes
+    traffic["cv_bypass_bytes"] = cv_bypass_bytes
 
     vector_bytes = 0.0
     mte3_bytes = 0.0

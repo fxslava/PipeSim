@@ -120,7 +120,11 @@ def _tile_values(
 
 def _modes(flow: AlgorithmFlow, arch: NpuArchitecture) -> tuple[ExecutionMode, ...]:
     if flow.op_type is OpType.VECTOR_GEMV:
-        return (ExecutionMode.HYBRID_SIMT_SIMD,) if flow.simt else ()
+        return (
+            (ExecutionMode.HYBRID_SIMT_SIMD,)
+            if flow.simt
+            else (ExecutionMode.AIV_ONLY,)
+        )
     if flow.op_type is OpType.ELEMWISE:
         return ()
     modes = [ExecutionMode.STANDALONE_CUBE]
@@ -162,7 +166,7 @@ def _candidate_flows(
                     tile_rows, 1, template.loops.k, tile_rows, 1, template.loops.k
                 )
             )
-            yield _lower(base, ExecutionMode.HYBRID_SIMT_SIMD, plan, "UB")
+            yield _lower(base, modes[0], plan, "UB")
         return
     k0 = arch.cube.profile(template.compute_dtype).k0
     axes = (
@@ -298,6 +302,8 @@ def _profile(item: BoundedEvaluation) -> str:
     flow = item.flow
     if flow.execution_graph.mode is ExecutionMode.HYBRID_SIMT_SIMD:
         return "SIMT prefill / SIMD GEMV"
+    if flow.execution_graph.mode is ExecutionMode.AIV_ONLY:
+        return "AIV-only SIMD GEMV"
     if flow.execution_graph.mode is ExecutionMode.STANDALONE_CUBE:
         return "Standalone Cube with inline Fixpipe"
     depth = flow.buffers.l1_depth

@@ -36,6 +36,7 @@ evaluated against multiple architectures.
 | Mode | Behavior |
 |---|---|
 | `standalone_cube` | Single-core Cube GEMM with the accumulator drained through inline Fixpipe. |
+| `aiv_only` | Standalone Vector-core path, including SIMD GEMV with no Cube work. |
 | `mix_split_m` | MIX cluster mode with one AIC and two AIV consumers; spatially bisects the M dimension, slices local UB epilogue operands, and synchronizes cores through a UB or GM workspace ring. |
 | `mix_split_n` | The corresponding two-AIV MIX mode with spatial bisection along N, local UB epilogue slicing, and UB- or GM-backed inter-core synchronization. |
 | `hybrid_simt_simd` | DaVinci v3 SIMT/SIMD path modeling warp prefill and packing, DataCache hits and misses, branch divergence, register pressure/spilling, and shared UB-port arbitration. |
@@ -43,7 +44,10 @@ evaluated against multiple architectures.
 The MIX schedule includes producer/consumer synchronization and can overlap
 handoffs with ring slots. The SIMT portion is enabled by workload metadata in
 the flow; architecture cache and scheduling assumptions come from the selected
-topology.
+topology. `BufferLifetime` intervals describe stage-local UB residency; aliases
+share one slot for in-place mutation, and non-overlapping buffers reuse storage.
+Vector GEMV supports packed MXFP4 weights, a distinct input dtype, and
+per-group scale metadata in its footprint and traffic estimates.
 
 ## Parametric uncertainty and Pareto frontier
 
@@ -63,6 +67,10 @@ predicted bounds; frontier search does not generate kernel source.
 
 See [Frontier exploration](docs/FRONTIER_EXPLORATION.md) for the full API,
 command-line, uncertainty-file, and scenario details.
+
+The [DeepSeek-V4 MoE expert pilot](examples/dsv4_moe_expert.py) is a runnable
+Ascend 950PR AIV-only projection/SwiGLU/down-projection model using frontier
+search and a full UB lifetime ledger.
 
 ## Supported hardware topologies
 

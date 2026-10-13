@@ -83,6 +83,8 @@
         "vector_cores": {"type": "integer", "minimum": 1, "description": "Vector/SIMD cores (may exceed cube_cores)."},
         "core_freq_mhz": {"type": "number", "exclusiveMinimum": 0},
         "l2_cache_bytes": {"type": "integer", "minimum": 0},
+        "l2_line_bytes": {"type": "integer", "minimum": 0},
+        "l2_sector_bytes": {"type": "integer", "minimum": 0},
         "hbm_bandwidth_gbps": {"type": "number", "minimum": 0, "description": "Aggregate off-chip bandwidth. No independent calibration is implied for commercial_label profiles."},
         "decoupled_vector_core": {"type": "boolean", "description": "False on fused Cube+Vector parts, where a Vector epilogue blocks Cube issue."}
       }

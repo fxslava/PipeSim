@@ -102,6 +102,8 @@ def test_json_profiles_are_standalone_v3():
         assert p["system"]["cube_cores"] == cores
         assert p["system"]["vector_cores"] == vectors
         assert p["system"]["hbm_bandwidth_gbps"] == bandwidth
+        assert p["system"]["l2_line_bytes"] == 512
+        assert p["system"]["l2_sector_bytes"] == 128
         assert p["memory_domains"]["L0C"]["size_bytes"] == 262144
         assert p["memory_domains"]["UB"]["size_bytes"] == (
             221184 if name == "ascend950pr" else 524288
@@ -325,17 +327,17 @@ def _ker05_flow(**workload_overrides):
     )
 
 
-def test_vf_mode_switch_penalty_field_default_and_window():
+def test_vf_mode_switch_penalty_field_default_and_is_configurable():
     pr = get_architecture("ascend950pr")
     assert pr.simt.vf_mode_switch_penalty_cycles == 64.0
     assert architecture_from_dict(pr.to_dict()).simt == pr.simt
-    for bad in (29.9, 80.1):
-        with pytest.raises(ValueError, match="30..80"):
+    for bad in (-1.0, float("inf")):
+        with pytest.raises(ValueError, match="finite and >= 0"):
             architecture_from_dict(
                 {"base": "ascend950pr",
                  "simt": {"vf_mode_switch_penalty_cycles": bad}}
             )
-    for edge in (30.0, 80.0):
+    for edge in (30.0, 64.0, 80.0, 100.0):
         tuned = architecture_from_dict(
             {"base": "ascend950pr",
              "simt": {"vf_mode_switch_penalty_cycles": edge}}
@@ -538,13 +540,13 @@ def test_ker05_probe_text_shows_switch_and_reduced_ub(capsys):
 def test_ker05_reduced_ub_footprint_and_whole_row_infeasibility(capsys):
     """The DataCache-resident weight path is what keeps KER-05's UB small.
 
-    The flow's 3-row chunking stages 32832 B - inside the kernel's 34944 B
+    The flow's 3-row chunking stages 28704 B - inside the kernel's 34944 B
     (34.1 KiB) static budget - while the whole-row tile the hybrid design
     replaced would overflow physical UB outright.
     """
     payload = _probe_payload(capsys, _FLOW_DIR / "ker05_mxfp4_expert_gemv_3.json")
     ub = payload["sram_footprints"]["UB"]
-    assert ub["bytes_used"] == 32832
+    assert ub["bytes_used"] == 28704
     assert ub["bytes_used"] <= _UB_BUDGET_KER05
 
     from ascend_pipesim.dsl import SimtWorkload
@@ -569,3 +571,107 @@ def test_ker05_reduced_ub_footprint_and_whole_row_infeasibility(capsys):
     report = evaluate(whole_row, "ascend950pr")
     assert not report.is_valid
     assert any(v.code == "UB_OVERFLOW" for v in report.violations)
+
+
+def test_950pr_dual_aiv_pathways_and_cache_geometry():
+    pr = get_architecture("arch35")
+    assert pr.vector_cores_per_cube == 2
+    assert pr.pipe("NDDMA").min_burst_bytes == 128
+    assert pr.pipe("NDDMA").src == "GM" and pr.pipe("NDDMA").dst == "UB"
+    assert pr.pipe("CV_BYPASS").src == "L1" and pr.pipe("CV_BYPASS").dst == "UB"
+    assert (pr.l2_line_bytes, pr.l2_sector_bytes) == (512, 128)
+    assert pr.simt.cache_line_bytes == 128
+    assert pr.simt.vf_mode_switch_penalty_cycles == 64
+    assert pr.simt.register_file_bytes == 128 * 1024
+    assert architecture_from_dict(pr.to_dict()).pipes == pr.pipes
+
+
+def test_gemv_accounts_for_mxfp4_scales_and_mixed_input_dtype():
+    flow = AlgorithmFlow.vector_gemv(
+        rows=32,
+        columns=4096,
+        tile_rows=32,
+        dtype="mxfp4",
+        input_dtype="bf16",
+        out_dtype="bf16",
+        weight_scale_bytes_per_group=1,
+        weight_scale_group_size=32,
+        buffers=BufferPlan.double(),
+        name="dsv4_gate_aiv",
+    )
+    report = evaluate(flow, "ascend950pr")
+    assert report.is_valid
+    assert report.traffic["mte2_bytes"] == pytest.approx(
+        32 * 4096 * 0.5 + 32 * 128 + 4096 * 2
+    )
+    assert report.sram_footprints["UB"].bytes_used == (
+        2 * (32 * 4096 * 0.5 + 32 * 128) + 4096 * 2 + 32 * 2
+    )
+    assert AlgorithmFlow.from_dict(flow.to_dict()) == flow
+    reused = evaluate(flow.evolve(input_preloaded=True), "ascend950pr")
+    assert reused.traffic["mte2_bytes"] == pytest.approx(
+        report.traffic["mte2_bytes"] - 4096 * 2
+    )
+    assert reused.sram_footprints["UB"].bytes_used == report.sram_footprints["UB"].bytes_used
+
+
+def test_ub_lifetimes_reuse_slots_and_support_in_place_aliases():
+    from ascend_pipesim.dsl import BufferLifetime
+
+    flow = AlgorithmFlow.elementwise(
+        elements=1024, tile_elements=1024, dtype="bf16", out_dtype="bf16"
+    ).evolve(
+        ub_lifetimes=(
+            BufferLifetime("gate", 2048, 0, 3),
+            BufferLifetime("up", 2048, 0, 1),
+            BufferLifetime("clamped_gate", 2048, 1, 2, alias_of="gate"),
+            BufferLifetime("swish_gate", 2048, 2, 2, alias_of="gate"),
+            BufferLifetime("activation", 2048, 3, 3, alias_of="gate"),
+        )
+    )
+    report = evaluate(flow, "ascend950pr")
+    assert report.is_valid
+    assert report.sram_footprints["UB"].bytes_used == 4096
+    assert report.sram_footprints["UB"].breakdown["gate"] == 2048
+    assert report.sram_footprints["UB"].breakdown["peak_at_stage_0"] == 4096
+
+
+def test_vector_epilogue_operands_reuse_nonoverlapping_ub_slots():
+    from ascend_pipesim import EpilogueOp, OutputPath, TensorSpec
+
+    flow = AlgorithmFlow.gemm(
+        m=16,
+        n=16,
+        k=16,
+        tile=(16, 16, 16),
+        subtile=(16, 16, 16),
+        output_path=OutputPath.FIXPIPE_UB_MTE3,
+        epilogue=(
+            EpilogueOp("scale", "vector", TensorSpec("scale_a", (16,), "fp32")),
+            EpilogueOp("bias", "vector", TensorSpec("bias_b", (16,), "fp32")),
+        ),
+    )
+    report = evaluate(flow, "ascend950pr")
+    assert report.sram_footprints["UB"].bytes_used == 2 * 16 * 16 * 2 + 16 * 4
+
+
+def test_cv_bypass_skips_fixpipe_and_is_available_only_on_v3_profiles():
+    from ascend_pipesim import EpilogueOp
+
+    flow = AlgorithmFlow.gemm(
+        m=16,
+        n=16,
+        k=16,
+        tile=(16, 16, 16),
+        subtile=(16, 16, 16),
+        output_path="cv_bypass_ub_mte3",
+        epilogue=(EpilogueOp("silu", "vector"),),
+    )
+    report = evaluate(flow, "ascend950pr")
+    assert report.is_valid
+    assert report.traffic["fixpipe_bytes"] == 0
+    assert report.traffic["cv_bypass_bytes"] > 0
+    assert any(stage.name == "CV_BYPASS" for stage in report.schedule.stages)
+    assert all(stage.name != "FIXPIPE" for stage in report.schedule.stages)
+    with pytest.raises(ValueError, match="does not model"):
+        evaluate(flow, "ascend910b")

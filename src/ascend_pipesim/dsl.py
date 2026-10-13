@@ -46,6 +46,7 @@ __all__ = [
     "KPosition",
     "OutputPath",
     "TensorSpec",
+    "BufferLifetime",
     "LoopNest",
     "TileConfig",
     "BufferPlan",
@@ -169,6 +170,7 @@ class OpType(str, Enum):
 
 class ExecutionMode(str, Enum):
     STANDALONE_CUBE = "standalone_cube"
+    AIV_ONLY = "aiv_only"
     MIX_SPLIT_M = "mix_split_m"
     MIX_SPLIT_N = "mix_split_n"
     HYBRID_SIMT_SIMD = "hybrid_simt_simd"
@@ -249,6 +251,9 @@ class OutputPath(str, Enum):
 
     FIXPIPE_UB_MTE3 = "fixpipe_ub_mte3"
     """L0C -> UB (Fixpipe) -> Vector epilogue -> GM (MTE3)."""
+
+    CV_BYPASS_UB_MTE3 = "cv_bypass_ub_mte3"
+    """Cube L1 -> Vector UB directly, then Vector epilogue -> GM (MTE3)."""
 
 
 # ---------------------------------------------------------------------------
@@ -575,6 +580,50 @@ class BufferPlan:
 
 
 @dataclass(frozen=True)
+class BufferLifetime:
+    """UB allocation live over an inclusive range of ordered pipeline stages.
+
+    ``alias_of`` describes an in-place mutation: the new logical value shares
+    the storage of an existing allocation instead of consuming another slot.
+    """
+
+    name: str
+    size_bytes: int
+    first_stage: int
+    last_stage: int
+    depth: int = 1
+    alias_of: str | None = None
+
+    def __post_init__(self) -> None:
+        if (
+            not self.name.strip()
+            or int(self.size_bytes) != self.size_bytes
+            or self.size_bytes <= 0
+        ):
+            raise FlowValidationError("UB lifetime name and size must be positive")
+        if self.first_stage < 0 or self.last_stage < self.first_stage:
+            raise FlowValidationError("UB lifetime stage interval is invalid")
+        if self.depth < 1:
+            raise FlowValidationError("UB lifetime depth must be >= 1")
+        if self.alias_of == self.name:
+            raise FlowValidationError("a UB allocation cannot alias itself")
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "name": self.name,
+            "size_bytes": self.size_bytes,
+            "first_stage": self.first_stage,
+            "last_stage": self.last_stage,
+            "depth": self.depth,
+            "alias_of": self.alias_of,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "BufferLifetime":
+        return cls(**data)
+
+
+@dataclass(frozen=True)
 class EpilogueOp:
     """One post-accumulation operation applied to the L0C result.
 
@@ -653,6 +702,10 @@ class AlgorithmFlow:
     notes: str = ""
     simt: SimtWorkload | None = None
     execution_graph: ExecutionGraph = field(default_factory=ExecutionGraph)
+    ub_lifetimes: tuple[BufferLifetime, ...] = ()
+    weight_scale_bytes_per_group: float = 0.0
+    weight_scale_group_size: int = 1
+    input_preloaded: bool = False
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "op_type", OpType(self.op_type))
@@ -660,7 +713,32 @@ class AlgorithmFlow:
         object.__setattr__(self, "k_position", KPosition(self.k_position))
         object.__setattr__(self, "output_path", OutputPath(self.output_path))
         object.__setattr__(self, "epilogue", tuple(self.epilogue))
+        object.__setattr__(self, "ub_lifetimes", tuple(self.ub_lifetimes))
         object.__setattr__(self, "tile", self.tile.bind(self.loops))
+        if (
+            not math.isfinite(self.weight_scale_bytes_per_group)
+            or self.weight_scale_bytes_per_group < 0
+            or self.weight_scale_group_size < 1
+        ):
+            raise FlowValidationError("weight scale metadata configuration is invalid")
+        lifetime_names = {life.name for life in self.ub_lifetimes}
+        if len(lifetime_names) != len(self.ub_lifetimes):
+            raise FlowValidationError("UB lifetime names must be unique")
+        for life in self.ub_lifetimes:
+            if life.alias_of and life.alias_of not in lifetime_names:
+                raise FlowValidationError(
+                    f"UB lifetime {life.name!r} aliases unknown buffer {life.alias_of!r}"
+                )
+        for life in self.ub_lifetimes:
+            visited: set[str] = set()
+            current = life
+            while current.alias_of:
+                if current.name in visited:
+                    raise FlowValidationError("UB lifetime aliases must be acyclic")
+                visited.add(current.name)
+                current = next(
+                    item for item in self.ub_lifetimes if item.name == current.alias_of
+                )
         if (
             self.execution_graph.mode is ExecutionMode.HYBRID_SIMT_SIMD
             and self.simt is None
@@ -721,6 +799,7 @@ class AlgorithmFlow:
     def uses_unified_buffer(self) -> bool:
         return (
             self.output_path is OutputPath.FIXPIPE_UB_MTE3
+            or self.output_path is OutputPath.CV_BYPASS_UB_MTE3
             or self.op_type is OpType.ELEMWISE
             or self.op_type is OpType.VECTOR_GEMV
             or any(not op.runs_on_fixpipe for op in self.epilogue)
@@ -926,13 +1005,19 @@ class AlgorithmFlow:
         columns: int,
         tile_rows: int,
         dtype: "str | DType" = DType.FP16,
+        input_dtype: "str | DType | None" = None,
         out_dtype: "str | DType" = DType.FP32,
+        weight_scale_bytes_per_group: float = 0.0,
+        weight_scale_group_size: int = 1,
+        input_preloaded: bool = False,
+        cores: int = 1,
         buffers: BufferPlan | None = None,
         simt: SimtWorkload | None = None,
         name: str = "vector_gemv",
     ) -> "AlgorithmFlow":
         """Build a SIMD GEMV with an optional fused SIMT packing phase."""
         in_dt, out_dt = DType.parse(dtype), DType.parse(out_dtype)
+        input_dt = DType.parse(input_dtype) if input_dtype is not None else in_dt
         if not 1 <= tile_rows <= rows:
             raise FlowValidationError("tile_rows must be between 1 and rows")
         # A fused SIMT phase makes this a hybrid SIMD/SIMT execution graph:
@@ -941,7 +1026,7 @@ class AlgorithmFlow:
         graph = (
             ExecutionGraph(mode=ExecutionMode.HYBRID_SIMT_SIMD)
             if simt is not None
-            else ExecutionGraph()
+            else ExecutionGraph(mode=ExecutionMode.AIV_ONLY)
         )
         return cls(
             name=name,
@@ -949,12 +1034,16 @@ class AlgorithmFlow:
             loops=LoopNest(m=rows, n=1, k=columns),
             tile=TileConfig(tile_rows, 1, columns, tile_rows, 1, columns),
             a=TensorSpec("weights", (rows, columns), in_dt),
-            b=TensorSpec("input", (columns,), in_dt),
+            b=TensorSpec("input", (columns,), input_dt),
             c=TensorSpec("output", (rows,), out_dt),
             buffers=buffers or BufferPlan.double(),
             simt=simt,
             execution_graph=graph,
             output_path=OutputPath.FIXPIPE_UB_MTE3,
+            cores=cores,
+            weight_scale_bytes_per_group=weight_scale_bytes_per_group,
+            weight_scale_group_size=weight_scale_group_size,
+            input_preloaded=input_preloaded,
         )
 
     @property
@@ -987,6 +1076,10 @@ class AlgorithmFlow:
             "notes": self.notes,
             "simt": self.simt.to_dict() if self.simt else None,
             "execution_graph": self.execution_graph.to_dict(),
+            "ub_lifetimes": [life.to_dict() for life in self.ub_lifetimes],
+            "weight_scale_bytes_per_group": self.weight_scale_bytes_per_group,
+            "weight_scale_group_size": self.weight_scale_group_size,
+            "input_preloaded": self.input_preloaded,
         }
 
     @classmethod
@@ -1010,6 +1103,12 @@ class AlgorithmFlow:
             notes=data.get("notes", ""),
             simt=SimtWorkload.from_dict(data["simt"]) if data.get("simt") else None,
             execution_graph=ExecutionGraph.from_dict(data.get("execution_graph", {})),
+            ub_lifetimes=tuple(
+                BufferLifetime.from_dict(life) for life in data.get("ub_lifetimes", [])
+            ),
+            weight_scale_bytes_per_group=float(data.get("weight_scale_bytes_per_group", 0.0)),
+            weight_scale_group_size=int(data.get("weight_scale_group_size", 1)),
+            input_preloaded=bool(data.get("input_preloaded", False)),
         )
 
     def describe(self) -> str:

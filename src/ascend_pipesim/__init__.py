@@ -7,6 +7,7 @@ from .codegen import KernelBundle, synthesize, synthesize_kernel
 from .dsl import (
     AlgorithmFlow,
     BufferPlan,
+    BufferLifetime,
     EpilogueOp,
     ExecutionGraph,
     ExecutionMode,
@@ -39,6 +40,7 @@ __all__ = [
     # dsl
     "AlgorithmFlow",
     "BufferPlan",
+    "BufferLifetime",
     "EpilogueOp",
     "ExecutionGraph",
     "ExecutionMode",

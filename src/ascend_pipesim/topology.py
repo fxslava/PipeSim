@@ -176,6 +176,8 @@ class PipeKind(str, Enum):
     MTE2 = "MTE2"  # GM -> L1 / UB (DataCopy, Nd2Nz)
     MTE3 = "MTE3"  # UB -> GM (DataCopy)
     FIXPIPE = "FIXPIPE"  # L0C -> GM / UB (Fixpipe; quant/dequant/ReLU)
+    NDDMA = "NDDMA"  # GM -> UB (up to 5D gather / layout transform)
+    CV_BYPASS = "CV_BYPASS"  # Cube L1 -> Vector UB
     CUBE = "CUBE"  # L0A x L0B -> L0C (Mmad)
     VECTOR = "VECTOR"  # UB -> UB (Add, Mul, Cast, ...)
     SCALAR = "SCALAR"  # address / loop bookkeeping
@@ -428,16 +430,18 @@ class SimtHardware:
     register_file_bytes: int = 128 * KiB
     max_threads_per_core: int = 2048
     #: Cycles the physically shared Vector ALU loses on each SIMD <-> SIMT
-    #: mode transition - an ``asc_vf_call`` dispatch boundary (drain, warp
-    #: reconfigure, drain back).  DaVinci v3 measured window is 30..80
-    #: cycles; 64 is the fleet default.
+    #: mode transition - an ``asc_vf_call`` dispatch boundary.  64 cycles is
+    #: the 950PR analytical default, not guaranteed instruction timing.
     vf_mode_switch_penalty_cycles: float = 64.0
 
     def __post_init__(self) -> None:
-        if not 30.0 <= self.vf_mode_switch_penalty_cycles <= 80.0:
+        if (
+            not math.isfinite(self.vf_mode_switch_penalty_cycles)
+            or self.vf_mode_switch_penalty_cycles < 0
+        ):
             raise ValueError(
-                "vf_mode_switch_penalty_cycles must stay inside the measured "
-                f"30..80 cycle window, got {self.vf_mode_switch_penalty_cycles}"
+                "vf_mode_switch_penalty_cycles must be finite and >= 0, got "
+                f"{self.vf_mode_switch_penalty_cycles}"
             )
 
     def to_dict(self) -> Dict[str, Any]:
@@ -476,6 +480,13 @@ class NpuArchitecture:
     decoupled_vector_core: bool = True
     notes: str = ""
     simt: "SimtHardware | None" = None
+    l2_line_bytes: int = 0
+    l2_sector_bytes: int = 0
+
+    @property
+    def vector_cores_per_cube(self) -> float:
+        """AIV-to-AIC ratio, including non-integral experimental profiles."""
+        return self.vector_cores / self.cube_cores if self.cube_cores else 0.0
 
     # -- lookups ----------------------------------------------------------
     def pool(self, name: str) -> MemoryPool:
@@ -551,6 +562,8 @@ class NpuArchitecture:
             "vector": self.vector.to_dict(),
             "notes": self.notes,
             "simt": self.simt.to_dict() if self.simt else None,
+            "l2_line_bytes": self.l2_line_bytes,
+            "l2_sector_bytes": self.l2_sector_bytes,
         }
 
 
@@ -629,9 +642,11 @@ def _standard_pipes(
     fixpipe_latency: float = 80.0,
     mte3_bpc: float = 64.0,
     mte3_latency: float = 150.0,
+    nddma: bool = False,
+    cv_bypass: bool = False,
 ) -> Dict[str, PipeChannel]:
     """The canonical DaVinci transfer-engine set."""
-    return {
+    pipes = {
         "MTE2": PipeChannel(
             "MTE2",
             PipeKind.MTE2,
@@ -688,6 +703,21 @@ def _standard_pipes(
             description="UB -> GM store.",
         ),
     }
+    if nddma:
+        pipes["NDDMA"] = PipeChannel(
+            "NDDMA", PipeKind.NDDMA, "GM", "UB",
+            bandwidth_bpc=128.0, base_latency_cycles=160.0,
+            max_outstanding=8, min_burst_bytes=128,
+            description="GM -> UB 5D gather/reformat; 128 B read coalescing.",
+        )
+    if cv_bypass:
+        pipes["CV_BYPASS"] = PipeChannel(
+            "CV_BYPASS", PipeKind.CV_BYPASS, "L1", "UB",
+            bandwidth_bpc=128.0, base_latency_cycles=20.0,
+            max_outstanding=4, min_burst_bytes=32,
+            description="Cube L1 -> Vector UB bypass with conversion.",
+        )
+    return pipes
 
 
 def _cube_unit(
@@ -878,15 +908,19 @@ def _ascend950pr() -> NpuArchitecture:
             fixpipe_bpc=128.0,
             mte3_bpc=128.0,
             mte2_latency=200.0,
+            nddma=True,
+            cv_bypass=True,
         ),
         cube=replace(cube, dtype_profiles=profiles),
         vector=_vector_unit(bytes_per_cycle=512.0),
         hbm_bandwidth_gbps=1600.0,
         l2_capacity_bytes=128 * MiB,
         simt=SimtHardware(vf_mode_switch_penalty_cycles=64.0),
+        l2_line_bytes=512,
+        l2_sector_bytes=128,
         notes="950PR arch35 AIV tensor ceiling is 216 KiB of 256 KiB physical UB. "
-        "SIMT VF dispatches pay the 64-cycle (30..80 measured) shared-ALU "
-        "mode-switch penalty per asc_vf_call boundary. "
+        "SIMT VF dispatches use a configurable 64-cycle analytical shared-ALU "
+        "mode-switch cost per asc_vf_call boundary; measure on target hardware. "
         "The 28/56, 112 GB and 112 MB L2 variants also exist. "
         "Frequency and local DMA rates are analytical estimates.",
     )
@@ -988,6 +1022,8 @@ def architecture_from_dict(data: Mapping[str, Any]) -> NpuArchitecture:
             "l2_capacity_bytes",
             "decoupled_vector_core",
             "notes",
+            "l2_line_bytes",
+            "l2_sector_bytes",
         )
         patch = {k: data[k] for k in scalar_keys if k in data}
         if patch:
@@ -1025,6 +1061,8 @@ def architecture_from_dict(data: Mapping[str, Any]) -> NpuArchitecture:
         decoupled_vector_core=bool(data.get("decoupled_vector_core", True)),
         notes=data.get("notes", ""),
         simt=SimtHardware(**data["simt"]) if data.get("simt") else None,
+        l2_line_bytes=int(data.get("l2_line_bytes", 0)),
+        l2_sector_bytes=int(data.get("l2_sector_bytes", 0)),
     )
 
 

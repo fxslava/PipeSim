@@ -27,6 +27,8 @@
     "vector_cores": 64,
     "core_freq_mhz": 1650,
     "l2_cache_bytes": 134217728,
+    "l2_line_bytes": 512,
+    "l2_sector_bytes": 128,
     "hbm_bandwidth_gbps": 1600.0,
     "decoupled_vector_core": true
   },
